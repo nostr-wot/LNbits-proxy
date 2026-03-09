@@ -336,7 +336,7 @@ const server = createServer(async (req, res) => {
 
       // Create pay link
       const payLinkId = randomBytes(6).toString('hex');
-      const now = new Date().toISOString();
+      const now = Date.now() / 1000;
       lnurlpDb.prepare(`
         INSERT INTO pay_links (id, wallet, description, min, max, served_meta, served_pr,
           webhook_url, success_text, success_url, currency, comment_chars,
