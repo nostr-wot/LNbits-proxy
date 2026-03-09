@@ -132,7 +132,12 @@ function proxyToLnbits(clientReq, clientRes) {
     port: url.port || 80,
     path: clientReq.url,
     method: clientReq.method,
-    headers: { ...clientReq.headers, host: url.host },
+    headers: {
+      ...clientReq.headers,
+      host: clientReq.headers["x-forwarded-host"] || clientReq.headers.host || url.host,
+      "x-forwarded-proto": clientReq.headers["x-forwarded-proto"] || "https",
+      "x-forwarded-host": clientReq.headers["x-forwarded-host"] || clientReq.headers.host,
+    },
   };
 
   console.log(`[proxy] ${clientReq.method} ${clientReq.url}`);
