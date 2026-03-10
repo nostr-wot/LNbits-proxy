@@ -19,6 +19,10 @@
  *   GET /.well-known/lnurlp/:username
  *   GET /lnurlp/api/v1/lnurl/cb/:id
  *
+ * Proxied wallet API paths (requires X-Api-Key, used by extension):
+ *   GET/POST /api/v1/wallet
+ *   GET/POST /api/v1/payments
+ *
  * Environment variables:
  *   LNBITS_URL       - LNbits backend URL (default: http://127.0.0.1:5000)
  *   LNBITS_ADMIN_KEY - LNbits super-user API key for wallet creation
@@ -63,6 +67,12 @@ const LNURL_CORS_HEADERS = {
 const PROXY_ALLOWLIST = [
   /^\/\.well-known\/lnurlp\/[a-z0-9._-]+$/,
   /^\/lnurlp\/api\/v1\/lnurl\/cb\/[a-zA-Z0-9]+$/,
+];
+
+// Wallet API paths that require X-Api-Key authentication (used by extension)
+const WALLET_API_ALLOWLIST = [
+  /^\/api\/v1\/wallet$/,
+  /^\/api\/v1\/payments$/,
 ];
 
 // ── Per-IP rate limiting ──
@@ -271,6 +281,53 @@ function proxyToLnbits(clientReq, clientRes, proxiedPath) {
 
   // LNURL callbacks are GET-only, no body to pipe
   proxy.end();
+}
+
+/**
+ * Proxy authenticated wallet API requests to LNbits.
+ * Forwards X-Api-Key for user wallet auth. Supports GET and POST.
+ */
+function proxyWalletApi(clientReq, clientRes, proxiedPath, body) {
+  const url = new URL(LNBITS_URL);
+  const headers = {
+    'host': url.host,
+    'content-type': 'application/json',
+    'x-forwarded-proto': 'https',
+    'x-forwarded-host': DOMAIN,
+  };
+  // Forward X-Api-Key (user's wallet key, not admin key)
+  if (clientReq.headers['x-api-key']) {
+    headers['x-api-key'] = clientReq.headers['x-api-key'];
+  }
+  if (body) {
+    headers['content-length'] = Buffer.byteLength(body);
+  }
+
+  const opts = {
+    hostname: url.hostname,
+    port: url.port || 80,
+    path: proxiedPath,
+    method: clientReq.method,
+    headers,
+  };
+
+  console.log(`[wallet-proxy] ${clientReq.method} ${proxiedPath}`);
+
+  const proxy = httpRequest(opts, (proxyRes) => {
+    clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(clientRes, { end: true });
+  });
+
+  proxy.on('error', (err) => {
+    console.error('[wallet-proxy] LNbits error:', err.message);
+    jsonResponse(clientRes, 502, { error: 'LNbits backend unavailable' });
+  });
+
+  if (body) {
+    proxy.end(body);
+  } else {
+    proxy.end();
+  }
 }
 
 /**
@@ -590,6 +647,22 @@ const server = createServer(async (req, res) => {
       // Use parsedUrl.pathname (normalized) instead of raw req.url
       const proxyPath = parsedUrl.pathname + parsedUrl.search;
       proxyToLnbits(req, res, proxyPath);
+      return;
+    }
+
+    // Wallet API proxy (requires X-Api-Key, supports GET/POST)
+    if ((req.method === 'GET' || req.method === 'POST') &&
+        WALLET_API_ALLOWLIST.some(re => re.test(parsedUrl.pathname))) {
+      if (!req.headers['x-api-key']) {
+        return jsonResponse(res, 401, { error: 'Missing X-Api-Key header' });
+      }
+      const proxyPath = parsedUrl.pathname + parsedUrl.search;
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        proxyWalletApi(req, res, proxyPath, body);
+      } else {
+        proxyWalletApi(req, res, proxyPath, null);
+      }
       return;
     }
 
