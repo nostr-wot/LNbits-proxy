@@ -259,7 +259,7 @@ function proxyToLnbits(clientReq, clientRes, proxiedPath) {
     headers: {
       'accept': clientReq.headers['accept'] || '*/*',
       'accept-encoding': clientReq.headers['accept-encoding'] || '',
-      'host': url.host,
+      'host': DOMAIN,
       'x-forwarded-proto': 'https',
       'x-forwarded-host': DOMAIN,
     },
