@@ -546,7 +546,7 @@ const server = createServer(async (req, res) => {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           payLinkId, wallet.id, 'Lightning Address', 1, 1000000, 0, 0,
-          '', '', '', '', 0, '', '', sanitizedUsername, 1, DOMAIN, now, now, 0
+          '', '', '', '', 255, '', '', sanitizedUsername, 1, DOMAIN, now, now, 0
         );
 
         // Update account username
