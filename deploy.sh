@@ -76,11 +76,21 @@ run install -m 0644 server.js "$PROVISION_DIR/server.js"
 run install -m 0644 nwc-connections.mjs "$PROVISION_DIR/nwc-connections.mjs"
 run install -m 0644 package.json "$PROVISION_DIR/package.json"
 run install -m 0644 package-lock.json "$PROVISION_DIR/package-lock.json"
+# The target has its own node_modules; refresh it so it matches the lockfile.
+run npm --prefix "$PROVISION_DIR" ci --omit=dev --silent
 
 say "Installing the monitor into $MONITOR_DIR"
 run mkdir -p "$MONITOR_DIR"
 run install -m 0755 monitor/monitor.mjs "$MONITOR_DIR/monitor.mjs"
 run install -m 0755 monitor/cleanup.py "$MONITOR_DIR/cleanup.py"
+run install -m 0755 monitor/run-monitor.sh "$MONITOR_DIR/run-monitor.sh"
+
+# The monitor refuses to run unconfigured, so a missing env file would silence
+# monitoring on the next cron tick rather than failing loudly here.
+if [ ! -r "$MONITOR_DIR/zaps-monitor.env" ]; then
+  echo "  WARNING: $MONITOR_DIR/zaps-monitor.env is missing; the monitor will not run." >&2
+  echo "           Create it from .env.example before the next cron tick." >&2
+fi
 
 say "Installing the phoenixd watchdog"
 run install -m 0755 monitor/check-phoenixd.sh /usr/local/bin/check-phoenixd.sh
@@ -116,6 +126,15 @@ check "public challenge"    200 "$BASE_URL/api/provision/challenge"
 check "wallet auth (no key)" 401 "$BASE_URL/api/v1/wallet"
 check "nwc (no key)"         401 "$BASE_URL/api/nwc/connections"
 check "unknown path"         404 "$BASE_URL/api/nope"
+
+if [ -x "$MONITOR_DIR/run-monitor.sh" ] && [ -r "$MONITOR_DIR/zaps-monitor.env" ]; then
+  if MONITOR_ENV_FILE="$MONITOR_DIR/zaps-monitor.env" "$MONITOR_DIR/run-monitor.sh" >/dev/null 2>&1; then
+    printf '  ok    %-34s ran clean\n' "monitor"
+  else
+    printf '  FAIL  %-34s exited non-zero\n' "monitor"
+    fail=1
+  fi
+fi
 
 if ! pm2 describe "$PM2_APP" | grep -q "online"; then
   echo "  FAIL  $PM2_APP is not online"
