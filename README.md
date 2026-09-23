@@ -1,133 +1,165 @@
 # LNbits Provisioning Proxy
 
-Provisioning proxy for `zaps.nostr-wot.com`. Sits in front of LNbits and handles challenge-response wallet provisioning and Lightning Address management.
+Sits in front of LNbits and gives Nostr clients a narrow, authenticated surface for
+provisioning wallets, claiming Lightning Addresses and managing Nostr Wallet Connect
+grants. LNbits' own administrative API is never exposed; only the paths below are served
+and everything else returns 404.
+
+Self-hosting guide, written for operators running their own instance:
+<https://nostr-wot.com/docs/lnbits-proxy>
 
 ## Endpoints
 
-### Wallet Provisioning
+### Wallet provisioning
 
 | Endpoint | Method | Auth | Purpose |
-|----------|--------|------|---------|
-| `/api/provision/challenge` | GET | None | Generate a random challenge |
-| `/api/provision` | POST | NIP-98 | Create or recover a wallet |
+|---|---|---|---|
+| `/api/provision/challenge` | GET | none | Issue a single-use challenge |
+| `/api/provision` | POST | NIP-98 | Create or recover a wallet for a pubkey |
 
 ### Lightning Address
 
 | Endpoint | Method | Auth | Purpose |
-|----------|--------|------|---------|
-| `/api/claim-username` | POST | NIP-98 | Claim a Lightning Address username |
-| `/api/lightning-address` | GET | None | Look up address by pubkey |
-| `/api/release-username` | POST | NIP-98 | Release a claimed address |
+|---|---|---|---|
+| `/api/claim-username` | POST | NIP-98 | Claim a username |
+| `/api/lightning-address?pubkey=<64 hex>` | GET | none | Look up the address for a pubkey |
+| `/api/release-username` | POST | NIP-98 | Release a claimed username |
 
-Only explicitly allowlisted LNURL and authenticated wallet paths are proxied. Other paths return 404.
+### NWC app connections
+
+| Endpoint | Method | Auth | Purpose |
+|---|---|---|---|
+| `/api/nwc/connections` | GET | wallet admin key | Active connections, budgets, provider metadata |
+| `/api/nwc/connections/{clientPubkey}` | PUT | wallet admin key | Register a client-generated key |
+| `/api/nwc/connections/{clientPubkey}` | DELETE | wallet admin key | Revoke that wallet's grant |
+
+All three require the wallet's **Admin** API key in `X-Api-Key`; invoice-only keys are
+rejected, and any query string returns 404. A repeat `PUT` for the same key is idempotent
+and returns 200 rather than editing the existing grant. New grants are fixed to
+`pay`/`lookup`/`info`, with a daily budget of 1–9,999,999 sats on a rolling 24 hours and
+an expiry of 1–365 days, capped at 50 active connections per wallet. Client secrets are
+generated in the client and never sent here.
+
+### Operations
+
+| Endpoint | Method | Auth | Purpose |
+|---|---|---|---|
+| `/healthz` | GET | none | Opens both databases, pings LNbits; 200 healthy, 503 otherwise |
+
+### Proxied LNbits paths
+
+Forwarded verbatim; nothing else is.
+
+```
+GET       /.well-known/lnurlp/{username}      public, permissive CORS
+GET       /lnurlp/api/v1/lnurl/cb/{id}        public, permissive CORS
+GET|POST  /api/v1/wallet                      requires X-Api-Key
+GET|POST  /api/v1/payments                    requires X-Api-Key
+```
+
+`Host` is rewritten to the public domain on the LNURL paths so LNbits builds correct
+callback URLs. `?api-key=` is rejected: LNbits accepts it, which would put wallet keys in
+access logs.
 
 ## Authentication
 
-Provisioning and Lightning Address mutations use NIP-98 challenge-response:
+Provisioning and every Lightning Address mutation use NIP-98 challenge-response.
 
-1. `GET /api/provision/challenge` returns `{ challenge: "<hex>" }`
-2. Client signs a kind:27235 event with the challenge in tags
-3. Client sends the signed event in the POST body
-4. Server verifies the Schnorr signature using nostr-tools
+1. `GET /api/provision/challenge` returns `{ "challenge": "<hex>" }`
+2. Build a kind `27235` event with **three mandatory tags**, all matched exactly:
+   - `u` — the full absolute URL being called, e.g. `https://<your-domain>/api/provision`
+   - `method` — the HTTP method, `POST`
+   - `challenge` — the challenge from step 1
+3. Send it as the `event` field of the POST body
+4. The Schnorr signature is verified *before* the challenge is consumed, so a failed
+   attempt does not burn it
 
-## Environment Variables
+Two independent windows apply: the challenge expires 60 seconds after it is issued, and
+the event's `created_at` must be within 60 seconds of server time. A client with a skewed
+clock fails even with a fresh challenge.
+
+## Rate limits
+
+Per client address per minute; over the limit returns 429.
+
+| Route | Limit |
+|---|---|
+| `/api/nwc/connections` | 60 |
+| `/api/v1/wallet`, `/api/v1/payments` | 120 |
+| LNURL passthrough | 60 |
+| `/api/provision/challenge` | 10 |
+| `/api/provision` | 5 |
+| `/api/claim-username`, `/api/release-username` | 3 |
+
+The client address is the rightmost `X-Forwarded-For` entry, which your reverse proxy
+appends. **If a CDN sits in front, set the real client IP** (`real_ip_header
+CF-Connecting-IP` plus `set_real_ip_from` for the CDN's ranges), otherwise every visitor
+behind one edge shares a single bucket.
+
+## Configuration
+
+Copy `.env.example`. Only `LNBITS_ADMIN_KEY` is required.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `LNBITS_URL` | `http://127.0.0.1:5000` | LNbits backend URL |
-| `LNBITS_ADMIN_KEY` | _(required)_ | LNbits super-user API key |
-| `LNBITS_DB_PATH` | `/home/lnbits/lnbits/data/database.sqlite3` | LNbits SQLite database |
-| `LNURLP_DB_PATH` | `/home/lnbits/lnbits/data/ext_lnurlp.sqlite3` | LNbits lnurlp extension database |
-| `PORT` | `3003` | Listen port |
+|---|---|---|
+| `LNBITS_URL` | `http://127.0.0.1:5000` | LNbits backend |
+| `LNBITS_ADMIN_KEY` | *(required)* | LNbits super-user key, never forwarded to clients |
+| `LNBITS_DB_PATH` | `/home/lnbits/lnbits/data/database.sqlite3` | LNbits database |
+| `LNURLP_DB_PATH` | `/home/lnbits/lnbits/data/ext_lnurlp.sqlite3` | lnurlp extension database |
+| `PORT` | `3003` | Loopback listen port |
 
-## Setup
+The service binds `127.0.0.1` only and refuses to start if a database path does not exist
+or the admin key is missing, rather than coming up and failing every request.
+
+> **The public domain is a constant in `server.js`, not an environment variable.** NIP-98
+> rejects any event whose `u` tag does not match it exactly, so an unmodified copy refuses
+> every provisioning request on another domain. Edit `DOMAIN` before deploying.
+
+## Running
 
 ```bash
-npm install
-LNBITS_ADMIN_KEY=your_key node server.js
+npm ci
+npm test          # proxy and alert-policy tests
+npm run test:cleanup   # invoice cleanup tests (python3)
+npm run check     # syntax check every entry point
+npm start
 ```
+
+Node 24+ is required; `node:sqlite` is experimental before it.
 
 ## Deployment
 
-Runs on `46.225.78.116` managed by pm2:
+`./deploy.sh` treats the checkout as the source of truth. It refuses to run from a dirty
+tree, backs up what it replaces with a dated stamp, installs the proxy, the monitor and
+the phoenixd watchdog units, restarts only the proxy process, and verifies the result.
 
 ```bash
-pm2 restart zaps-provision
-pm2 logs zaps-provision
+./deploy.sh --dry-run    # show the plan, change nothing
+./deploy.sh              # deploy origin/main
+./deploy.sh --ref <ref>  # roll back to a specific ref
 ```
 
-Nginx proxies `zaps.nostr-wot.com` to port 3003.
-
-## Username Validation
-
-Lightning Address usernames must match: `^[a-z0-9][a-z0-9._-]{1,28}[a-z0-9]$`
-
-- 3-30 characters
-- Lowercase alphanumeric, dots, hyphens, underscores
-- Must start and end with alphanumeric
-- Reserved names blocked: admin, support, help, info, noreply, postmaster, webmaster, abuse, root, system
+Put a reverse proxy in front for TLS; see the self-hosting guide for a worked nginx
+configuration.
 
 ## Monitoring
 
-### Email alerts (`monitor/monitor.mjs`)
+- **`monitor/monitor.mjs`** — every 5 minutes via cron, through `monitor/run-monitor.sh`,
+  which loads `zaps-monitor.env` because cron passes no environment. Checks LNbits, the
+  proxy, the LNURL paths, the Lightning backend and end-to-end invoice generation, and
+  emails on state change. Two consecutive failures are required before alerting
+  (`MONITOR_ALERT_AFTER`), so a single blip stays quiet.
+- **`monitor/cleanup.py`** — retires the invoice the end-to-end check mints, and can prune
+  expired unpaid invoices. It deletes only after the Lightning backend confirms an invoice
+  was never paid, takes a dated database backup first, and re-checks its conditions inside
+  the `DELETE` so a settlement racing the prune is never overwritten.
+- **`monitor/check-phoenixd.*`** — systemd timer that restarts phoenixd when its HTTP API
+  stops responding. See [`monitor/PHOENIXD-WATCHDOG.md`](monitor/PHOENIXD-WATCHDOG.md).
 
-Cron-based health checker that runs every 5 minutes and emails alerts via Resend when any component fails. Checks LNbits, the provisioning proxy, LNURL endpoints, phoenixd, and end-to-end invoice generation.
+## When something breaks
 
-### Phoenixd watchdog (`check-phoenixd.timer`)
+See [`RUNBOOK.md`](RUNBOOK.md).
 
-Systemd timer that checks phoenixd's HTTP API every 2 minutes and auto-restarts it if unresponsive. See [`monitor/PHOENIXD-WATCHDOG.md`](monitor/PHOENIXD-WATCHDOG.md) for details and commands.
+## Licence
 
-## Known Issues
-
-### Phoenixd hangs with unresponsive HTTP API
-
-**Symptom**: Wallets report "problem processing the lnurl" or "payment failed". LNbits logs show `Unable to connect to http://127.0.0.1:9740., Status: pending`. Phoenixd process is alive (`systemctl status phoenixd` shows active) but `curl http://127.0.0.1:9740/getinfo` times out.
-
-**Cause**: Phoenixd gets stuck in a reconnect loop to ACINQ's LSP node, logging repeated `ECONNRESET (104): Connection reset by peer` and `Noise handshake` errors. This blocks the Kotlin coroutine event loop, making the HTTP server unresponsive even though the process is still running and listening on port 9740.
-
-**Fix**: `systemctl restart phoenixd` — service recovers immediately. The `check-phoenixd.timer` watchdog now handles this automatically.
-
-**How to diagnose**:
-```bash
-# 1. Check if LNbits can reach phoenixd
-journalctl -u lnbits --since '10 min ago' | grep 9740
-
-# 2. Check if phoenixd API responds (should return JSON instantly)
-PASS=$(grep http-password /home/phoenixd/.phoenix/phoenix.conf | head -1 | cut -d= -f2)
-curl -m 5 -u ":$PASS" http://127.0.0.1:9740/getinfo
-
-# 3. Check phoenixd logs for reconnect loop
-tail -50 /home/phoenixd/.phoenix/phoenix.log | grep -i 'ECONNRESET\|CLOSED\|ESTABLISHING'
-
-# 4. Restart if confirmed hung
-systemctl restart phoenixd
-```
-
-**First occurrence**: 2026-04-15, ~11:54 UTC. Phoenixd was stuck for ~5 hours before manual restart.
-
-## NWC app connections
-
-See [AGENTS.md](AGENTS.md) for repository ownership and operational rules.
-`nwc-connections.mjs` serves these routes through `server.js`:
-
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | `/api/nwc/connections` | Active connections, budget usage and public provider/relay metadata |
-| PUT | `/api/nwc/connections/{clientPubkey}` | Register a client-generated key with `{name,dailyLimit,days}` |
-| DELETE | `/api/nwc/connections/{clientPubkey}` | Revoke that wallet's grant |
-
-All require `X-Api-Key` containing that wallet's Admin API key; invoice-only keys
-are rejected. No URL authentication, general-purpose proxy, admin configuration or
-pairing-secret endpoint is exposed. Responses use `Cache-Control: no-store`.
-Creation enables the installed NWC extension for the authenticated LNbits user.
-LNbits remains authoritative for account restrictions, ownership and budget enforcement.
-Limits are 1–9,999,999 sats per 24 hours and 1–365 days; permissions are pay, lookup,
-and info. A repeat PUT for the same public key is idempotent, not an edit.
-
-The browser extension creates independent secrets, stores them encrypted, and forms
-pairing strings locally. The proxy returns no client secrets. Existing wallets work
-without reprovisioning. Revocation does not cancel already-dispatched payments.
-Custom LNbits instances need this API adapter to use the extension's management UI.
-
-Validation: `npm test` uses isolated SQLite and HTTP fixtures, with no customer funds.
-The extension maintains its own matching HTTP-contract, encrypted-storage and UI tests.
+MIT. See [`LICENSE`](LICENSE).
