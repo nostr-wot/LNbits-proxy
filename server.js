@@ -32,6 +32,7 @@
  */
 
 import { createServer, request as httpRequest } from 'node:http';
+import { createNwcRoutes } from './nwc-connections.mjs';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { verifyEvent } from 'nostr-tools/pure';
@@ -40,6 +41,7 @@ const LNBITS_URL = process.env.LNBITS_URL || 'http://127.0.0.1:5000';
 const LNBITS_ADMIN_KEY = process.env.LNBITS_ADMIN_KEY;
 const LNBITS_DB_PATH = process.env.LNBITS_DB_PATH || '/home/lnbits/lnbits/data/database.sqlite3';
 const LNURLP_DB_PATH = process.env.LNURLP_DB_PATH || '/home/lnbits/lnbits/data/ext_lnurlp.sqlite3';
+const nwcRoutes = createNwcRoutes({backend:LNBITS_URL,dbPath:LNBITS_DB_PATH});
 const PORT = parseInt(process.env.PORT || '3003', 10);
 const CHALLENGE_TTL_MS = 60_000; // 60 seconds
 const CHALLENGE_MAX = 10_000;
@@ -78,6 +80,7 @@ const WALLET_API_ALLOWLIST = [
 // ── Per-IP rate limiting ──
 
 const rateLimitBuckets = {
+  nwc:        { maxPerMin: 60, entries: new Map() },
   challenge:  { maxPerMin: 10, entries: new Map() },
   provision:  { maxPerMin: 5,  entries: new Map() },
   claim:      { maxPerMin: 3,  entries: new Map() },
@@ -410,6 +413,11 @@ const server = createServer(async (req, res) => {
 
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
+    if (parsedUrl.pathname === '/api/nwc/connections' || parsedUrl.pathname.startsWith('/api/nwc/connections/')) {
+      if (!checkRateLimit(clientIp, 'nwc')) return jsonResponse(res, 429, { error: 'Too many requests' });
+      if (await nwcRoutes(req, res, parsedUrl)) return;
+    }
+
     // GET /api/provision/challenge
     if (req.method === 'GET' && parsedUrl.pathname === '/api/provision/challenge') {
       if (!checkRateLimit(clientIp, 'challenge')) {
@@ -645,7 +653,28 @@ const server = createServer(async (req, res) => {
     // Only proxy allowlisted LNURL paths (GET only), everything else is 404
     if (req.method === 'GET' && PROXY_ALLOWLIST.some(re => re.test(parsedUrl.pathname))) {
       // Use parsedUrl.pathname (normalized) instead of raw req.url
-      const proxyPath = parsedUrl.pathname + parsedUrl.search;
+      let proxyPath = parsedUrl.pathname + parsedUrl.search;
+      // NIP-57 fix (issue #8): some clients double-URL-encode the `nostr` zap
+      // request. LNbits decodes the query once, so the value is still
+      // percent-encoded and lnurlp's send_zap() crashes on json.loads(),
+      // never publishing the kind:9735 receipt (the invoice still settles).
+      // If we detect a double-encoded `nostr`, rebuild the query with it
+      // encoded exactly once. Correctly single-encoded clients are untouched.
+      const nostrParam = parsedUrl.searchParams.get('nostr');
+      if (nostrParam !== null && !nostrParam.trimStart().startsWith('{')) {
+        let decoded = nostrParam;
+        for (let i = 0; i < 4 && !decoded.trimStart().startsWith('{'); i++) {
+          try {
+            const next = decodeURIComponent(decoded);
+            if (next === decoded) break;
+            decoded = next;
+          } catch (e) { break; }
+        }
+        if (decoded.trimStart().startsWith('{')) {
+          parsedUrl.searchParams.set('nostr', decoded);
+          proxyPath = parsedUrl.pathname + '?' + parsedUrl.searchParams.toString();
+        }
+      }
       proxyToLnbits(req, res, proxyPath);
       return;
     }

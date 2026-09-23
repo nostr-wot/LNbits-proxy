@@ -19,11 +19,11 @@ Provisioning proxy for `zaps.nostr-wot.com`. Sits in front of LNbits and handles
 | `/api/lightning-address` | GET | None | Look up address by pubkey |
 | `/api/release-username` | POST | NIP-98 | Release a claimed address |
 
-All other requests are proxied through to LNbits.
+Only explicitly allowlisted LNURL and authenticated wallet paths are proxied. Other paths return 404.
 
 ## Authentication
 
-All authenticated endpoints use NIP-98 challenge-response:
+Provisioning and Lightning Address mutations use NIP-98 challenge-response:
 
 1. `GET /api/provision/challenge` returns `{ challenge: "<hex>" }`
 2. Client signs a kind:27235 event with the challenge in tags
@@ -104,3 +104,30 @@ systemctl restart phoenixd
 ```
 
 **First occurrence**: 2026-04-15, ~11:54 UTC. Phoenixd was stuck for ~5 hours before manual restart.
+
+## NWC app connections
+
+See [AGENTS.md](AGENTS.md) for repository ownership and operational rules.
+`nwc-connections.mjs` serves these routes through `server.js`:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/nwc/connections` | Active connections, budget usage and public provider/relay metadata |
+| PUT | `/api/nwc/connections/{clientPubkey}` | Register a client-generated key with `{name,dailyLimit,days}` |
+| DELETE | `/api/nwc/connections/{clientPubkey}` | Revoke that wallet's grant |
+
+All require `X-Api-Key` containing that wallet's Admin API key; invoice-only keys
+are rejected. No URL authentication, general-purpose proxy, admin configuration or
+pairing-secret endpoint is exposed. Responses use `Cache-Control: no-store`.
+Creation enables the installed NWC extension for the authenticated LNbits user.
+LNbits remains authoritative for account restrictions, ownership and budget enforcement.
+Limits are 1–9,999,999 sats per 24 hours and 1–365 days; permissions are pay, lookup,
+and info. A repeat PUT for the same public key is idempotent, not an edit.
+
+The browser extension creates independent secrets, stores them encrypted, and forms
+pairing strings locally. The proxy returns no client secrets. Existing wallets work
+without reprovisioning. Revocation does not cancel already-dispatched payments.
+Custom LNbits instances need this API adapter to use the extension's management UI.
+
+Validation: `npm test` uses isolated SQLite and HTTP fixtures, with no customer funds.
+The extension maintains its own matching HTTP-contract, encrypted-storage and UI tests.
