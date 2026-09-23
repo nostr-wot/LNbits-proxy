@@ -4,7 +4,10 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "monitor": "node monitor/monitor.mjs",
+    "test:cleanup": "cd monitor && python3 -m unittest test_cleanup",
+    "check": "node --check server.js && node --check nwc-connections.mjs && node --check monitor/monitor.mjs"
   },
   "dependencies": {
     "nostr-tools": "^2.10.4"
