@@ -28,6 +28,7 @@
  *   LNBITS_ADMIN_KEY - LNbits super-user API key for wallet creation
  *   LNBITS_DB_PATH   - Path to LNbits SQLite database
  *   LNURLP_DB_PATH   - Path to LNbits lnurlp extension database
+ *   PROVISION_DB_PATH - Proxy-owned pubkey to wallet mapping (not LNbits')
  *   PORT             - Listen port (default: 3003)
  */
 
@@ -42,6 +43,12 @@ const LNBITS_URL = process.env.LNBITS_URL || 'http://127.0.0.1:5000';
 const LNBITS_ADMIN_KEY = process.env.LNBITS_ADMIN_KEY;
 const LNBITS_DB_PATH = process.env.LNBITS_DB_PATH || '/home/lnbits/lnbits/data/database.sqlite3';
 const LNURLP_DB_PATH = process.env.LNURLP_DB_PATH || '/home/lnbits/lnbits/data/ext_lnurlp.sqlite3';
+// Proxy-owned mapping of Nostr pubkey to wallet. Deliberately NOT inside the
+// LNbits database: LNbits lets any logged-in user set accounts.pubkey on their
+// own account with no proof they hold the key, so that column cannot be the
+// thing that decides whose wallet is whose. This file must be writable only by
+// the user this service runs as.
+const PROVISION_DB_PATH = process.env.PROVISION_DB_PATH || '/srv/zaps-provision/provisioning.sqlite3';
 const nwcRoutes = createNwcRoutes({backend:LNBITS_URL,dbPath:LNBITS_DB_PATH});
 const PORT = parseInt(process.env.PORT || '3003', 10);
 const CHALLENGE_TTL_MS = 60_000; // 60 seconds
@@ -68,6 +75,29 @@ function openDb(path, options = {}) {
   const db = new DatabaseSync(path, options);
   try {
     db.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS}`);
+  } catch (e) {
+    db.close();
+    throw e;
+  }
+  return db;
+}
+
+/**
+ * Open the proxy's own database, creating it and its schema on first use.
+ * Unlike the LNbits databases, this one is ours to create.
+ */
+function openProvisionDb() {
+  const db = new DatabaseSync(PROVISION_DB_PATH);
+  try {
+    db.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS}`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS provisioned (
+        pubkey     TEXT PRIMARY KEY,
+        user_id    TEXT NOT NULL,
+        wallet_id  TEXT NOT NULL,
+        created_at REAL NOT NULL
+      )
+    `);
   } catch (e) {
     db.close();
     throw e;
@@ -429,18 +459,38 @@ function proxyWalletApi(clientReq, clientRes, proxiedPath, body) {
  * Returns { id, adminkey, name, user, ... } or null if not found.
  */
 function findWalletByPubkey(pubkey) {
+  // Step 1: which wallet did THIS service record for this pubkey, after
+  // verifying a NIP-98 signature from it. accounts.pubkey is never consulted.
+  let mapping;
+  const pdb = openProvisionDb();
+  try {
+    mapping = pdb.prepare('SELECT user_id, wallet_id FROM provisioned WHERE pubkey = ?').get(pubkey);
+  } catch (e) {
+    console.error('[provision] provisioning lookup error:', e.message);
+    throw new Error('Database lookup failed');
+  } finally {
+    pdb.close();
+  }
+  if (!mapping) return null;
+
+  // Step 2: read that specific wallet out of LNbits.
   const db = openDb(LNBITS_DB_PATH, { readOnly: true });
   try {
     const row = db.prepare(`
       SELECT w.id, w.name, w.adminkey, w.inkey, w."user"
-      FROM accounts a
-      JOIN wallets w ON w."user" = a.id
-      WHERE a.pubkey = ?
+      FROM wallets w
+      WHERE w.id = ?
+        AND w."user" = ?
         AND w.deleted = 0
-      ORDER BY w.created_at ASC
-      LIMIT 1
-    `).get(pubkey);
-    return row || null;
+    `).get(mapping.wallet_id, mapping.user_id);
+    if (!row) {
+      // Mapped wallet is gone. Report unprovisioned so a new one is created;
+      // the insert below upserts, so the stale row is replaced rather than
+      // blocking on the primary key.
+      console.warn(`[provision] mapped wallet ${mapping.wallet_id} missing or deleted for pubkey ${pubkey.slice(0, 16)}...`);
+      return null;
+    }
+    return row;
   } catch (e) {
     console.error('[provision] SQLite lookup error:', e.message);
     throw new Error('Database lookup failed');
@@ -471,35 +521,50 @@ async function createLnbitsWallet(walletName) {
 }
 
 /**
- * Link a freshly created LNbits account to its Nostr pubkey.
+ * Record that a Nostr pubkey owns a wallet.
  *
- * This write is what makes the wallet findable again: findWalletByPubkey joins
- * on accounts.pubkey, so an account that never gets linked is invisible to
- * every later provision, which would then create a second wallet and strand
- * the first. Retries, and throws rather than swallowing, so the caller can
- * refuse to hand out keys for a wallet it cannot find again.
+ * The row in the proxy's own database is the authoritative one: it is written
+ * only here, only after verifyNip98Event has checked a signature from this
+ * pubkey, and the file is not writable by LNbits or its users. accounts.pubkey
+ * is mirrored afterwards purely so LNbits' own UI shows the association; it is
+ * never read back for authorization.
  *
- * Username is deliberately not set here: accounts.username is an LNbits login
- * identifier with no UNIQUE constraint, and the value available at provision
- * time is an unvalidated client-supplied wallet name. claim-username sets it
- * properly, against the username rules.
+ * Throws if the authoritative write fails, so the caller can refuse to hand out
+ * keys for a wallet it would not be able to find again.
  */
-function linkWalletToPubkey(userId, pubkey) {
-  let lastError;
+function linkWalletToPubkey(userId, walletId, pubkey) {
+  let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    const pdb = openProvisionDb();
+    try {
+      pdb.prepare(`
+        INSERT INTO provisioned (pubkey, user_id, wallet_id, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(pubkey) DO UPDATE SET user_id = excluded.user_id, wallet_id = excluded.wallet_id
+      `).run(pubkey, userId, walletId, Date.now() / 1000);
+      lastError = null;
+      break;
+    } catch (e) {
+      lastError = e;
+      console.error(`[provision] mapping attempt ${attempt}/3 for user ${userId} failed:`, e.message);
+    } finally {
+      pdb.close();
+    }
+  }
+  if (lastError) throw new Error(`PUBKEY_LINK_FAILED: ${lastError.message}`);
+  console.log(`[provision] mapped pubkey ${pubkey.slice(0, 16)}... to wallet ${walletId}`);
+
+  // Cosmetic mirror into LNbits. A failure here costs nothing: nothing reads it.
+  try {
     const db = openDb(LNBITS_DB_PATH);
     try {
       db.prepare('UPDATE accounts SET pubkey = ? WHERE id = ?').run(pubkey, userId);
-      console.log(`[provision] linked user ${userId}: pubkey=${pubkey.slice(0, 16)}...`);
-      return;
-    } catch (e) {
-      lastError = e;
-      console.error(`[provision] link attempt ${attempt}/3 for user ${userId} failed:`, e.message);
     } finally {
       db.close();
     }
+  } catch (e) {
+    console.warn(`[provision] could not mirror pubkey into LNbits accounts (harmless):`, e.message);
   }
-  throw new Error(`PUBKEY_LINK_FAILED: ${lastError?.message}`);
 }
 
 // ── Request handler ──
@@ -586,7 +651,7 @@ const server = createServer(async (req, res) => {
         // Create new wallet via LNbits
         const wallet = await createLnbitsWallet(sanitizedName);
         try {
-          linkWalletToPubkey(wallet.user, verified.pubkey);
+          linkWalletToPubkey(wallet.user, wallet.id, verified.pubkey);
         } catch (e) {
           // The wallet exists but is not reachable by pubkey. Returning its keys
           // would let it receive sats that no later provision could ever find.
@@ -889,6 +954,11 @@ const startupProblems = [];
 if (!LNBITS_ADMIN_KEY) startupProblems.push('LNBITS_ADMIN_KEY is not set');
 for (const [label, path] of [['LNBITS_DB_PATH', LNBITS_DB_PATH], ['LNURLP_DB_PATH', LNURLP_DB_PATH]]) {
   if (!existsSync(path)) startupProblems.push(`${label} does not exist: ${path}`);
+}
+try {
+  openProvisionDb().close();
+} catch (e) {
+  startupProblems.push(`PROVISION_DB_PATH is not usable (${PROVISION_DB_PATH}): ${e.message}`);
 }
 if (startupProblems.length) {
   for (const problem of startupProblems) console.error(`[zaps-provision] FATAL: ${problem}`);
