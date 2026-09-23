@@ -54,10 +54,12 @@ run node --check monitor/monitor.mjs
 
 say "Comparing against what is live"
 for f in server.js nwc-connections.mjs; do
-  if [ -f "$PROVISION_DIR/$f" ] && ! diff -q "$f" "$PROVISION_DIR/$f" >/dev/null; then
-    echo "  $f differs and will be replaced"
-  else
+  if [ ! -f "$PROVISION_DIR/$f" ]; then
+    echo "  $f is not installed yet and will be created"
+  elif diff -q "$f" "$PROVISION_DIR/$f" >/dev/null; then
     echo "  $f unchanged"
+  else
+    echo "  $f differs and will be replaced"
   fi
 done
 
