@@ -51,6 +51,24 @@ const BASE_URL = `https://${DOMAIN}`;
 const MAX_BODY_BYTES = 65_536;   // 64KB body limit
 const WALLET_NAME_MAX = 50;
 const PUBKEY_RE = /^[0-9a-f]{64}$/;
+const DB_BUSY_TIMEOUT_MS = 5_000;  // wait out concurrent LNbits writes
+const UPSTREAM_TIMEOUT_MS = 30_000;
+
+/**
+ * Open an LNbits SQLite database with a busy timeout.
+ * node:sqlite defaults to 0, so any concurrent LNbits write makes the very next
+ * statement throw SQLITE_BUSY. Every caller here shares live LNbits databases.
+ */
+function openDb(path, options = {}) {
+  const db = new DatabaseSync(path, options);
+  try {
+    db.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS}`);
+  } catch (e) {
+    db.close();
+    throw e;
+  }
+  return db;
+}
 
 const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{1,28}[a-z0-9]$/;
 const RESERVED_USERNAMES = new Set([
@@ -85,6 +103,11 @@ const rateLimitBuckets = {
   provision:  { maxPerMin: 5,  entries: new Map() },
   claim:      { maxPerMin: 3,  entries: new Map() },
   release:    { maxPerMin: 3,  entries: new Map() },
+  // Unauthenticated LNURL callbacks create a real invoice in LNbits and the
+  // Lightning backend on every hit. A real wallet calls once per zap, so this
+  // is generous while still bounding invoice-flooding from a single host.
+  lnurl:      { maxPerMin: 60, entries: new Map() },
+  wallet:     { maxPerMin: 120, entries: new Map() },
 };
 
 function checkRateLimit(ip, bucket) {
@@ -153,21 +176,34 @@ function jsonResponse(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-/** Read body with size limit */
+/**
+ * Read body with size limit.
+ *
+ * Over the limit we stop buffering and reject, but leave the socket alive so
+ * the caller's 413 actually reaches the client. Destroying here made every
+ * oversize request surface as ECONNRESET instead. A body far past the limit is
+ * an abusive client, so that one does get cut off.
+ */
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let tooLarge = false;
     req.on('data', (c) => {
       size += c.length;
       if (size > MAX_BODY_BYTES) {
-        req.destroy();
-        reject(new Error('BODY_TOO_LARGE'));
+        if (!tooLarge) {
+          tooLarge = true;
+          reject(new Error('BODY_TOO_LARGE'));
+        }
+        if (size > MAX_BODY_BYTES * 4) req.destroy();
         return;
       }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    req.on('end', () => {
+      if (!tooLarge) resolve(Buffer.concat(chunks).toString());
+    });
     req.on('error', reject);
   });
 }
@@ -198,27 +234,38 @@ function verifyNip98Event(event, res, expectedUrl, expectedMethod) {
     return null;
   }
 
+  // Malformed tags must not reach t[0] and throw a 500 out of the handler
+  if (!Array.isArray(event.tags)) {
+    jsonResponse(res, 400, { error: 'Invalid event tags' });
+    return null;
+  }
+  const tags = event.tags.filter((t) => Array.isArray(t));
+
   // Validate 'u' tag matches expected URL
-  const uTag = event.tags?.find((t) => t[0] === 'u');
+  const uTag = tags.find((t) => t[0] === 'u');
   if (!uTag || uTag[1] !== expectedUrl) {
     jsonResponse(res, 400, { error: 'Invalid or missing "u" tag in event' });
     return null;
   }
 
   // Validate 'method' tag matches expected HTTP method
-  const methodTag = event.tags?.find((t) => t[0] === 'method');
+  const methodTag = tags.find((t) => t[0] === 'method');
   if (!methodTag || methodTag[1] !== expectedMethod) {
     jsonResponse(res, 400, { error: 'Invalid or missing "method" tag in event' });
     return null;
   }
 
-  const challengeTag = event.tags?.find((t) => t[0] === 'challenge');
+  const challengeTag = tags.find((t) => t[0] === 'challenge');
   if (!challengeTag || !challengeTag[1]) {
     jsonResponse(res, 400, { error: 'Missing challenge tag in event' });
     return null;
   }
   const challenge = challengeTag[1];
-  if (!challenges.has(challenge)) {
+  // Check age here rather than relying on the 30s sweeper, which otherwise let
+  // a challenge stay usable for up to ~90s.
+  const issuedAt = challenges.get(challenge);
+  if (issuedAt === undefined || Date.now() - issuedAt > CHALLENGE_TTL_MS) {
+    challenges.delete(challenge);
     jsonResponse(res, 400, { error: 'Invalid or expired challenge' });
     return null;
   }
@@ -268,18 +315,42 @@ function proxyToLnbits(clientReq, clientRes, proxiedPath) {
     },
   };
 
-  console.log(`[proxy] GET ${proxiedPath}`);
+  // pathname only: the query carries the NIP-57 zap request and payer comment
+  console.log(`[proxy] GET ${new URL(proxiedPath, 'http://x').pathname}`);
 
   const proxy = httpRequest(opts, (proxyRes) => {
     const headers = { ...proxyRes.headers, ...LNURL_CORS_HEADERS };
     clientRes.writeHead(proxyRes.statusCode, headers);
+    // If LNbits dies mid-body the reset lands here, not on the request object.
+    // Without this the client waits out its own timeout on a response that
+    // announced a Content-Length it will never receive.
+    const abandon = (err) => {
+      console.error('[proxy] LNbits aborted mid-response:', err?.message || 'aborted');
+      clientRes.destroy();
+    };
+    proxyRes.on('aborted', abandon);
+    proxyRes.on('error', abandon);
     proxyRes.pipe(clientRes, { end: true });
   });
 
   proxy.on('error', (err) => {
     console.error('[proxy] LNbits error:', err.message);
+    // If LNbits resets after we already relayed its headers, writeHead throws
+    // ERR_HTTP_HEADERS_SENT from inside this handler, outside any try/catch:
+    // an uncaught exception that kills the process and wipes every challenge.
+    if (clientRes.headersSent) {
+      clientRes.destroy();
+      return;
+    }
     clientRes.writeHead(502, { 'Content-Type': 'application/json', ...LNURL_CORS_HEADERS });
     clientRes.end(JSON.stringify({ error: 'LNbits backend unavailable' }));
+  });
+
+  // Do not hold a socket open while LNbits hangs, and drop the upstream request
+  // if the client gave up first.
+  proxy.setTimeout(UPSTREAM_TIMEOUT_MS, () => proxy.destroy(new Error('Upstream timeout')));
+  clientReq.on('close', () => {
+    if (!clientRes.writableEnded) proxy.destroy();
   });
 
   // LNURL callbacks are GET-only, no body to pipe
@@ -314,16 +385,31 @@ function proxyWalletApi(clientReq, clientRes, proxiedPath, body) {
     headers,
   };
 
-  console.log(`[wallet-proxy] ${clientReq.method} ${proxiedPath}`);
+  console.log(`[wallet-proxy] ${clientReq.method} ${new URL(proxiedPath, 'http://x').pathname}`);
 
   const proxy = httpRequest(opts, (proxyRes) => {
     clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+    const abandon = (err) => {
+      console.error('[wallet-proxy] LNbits aborted mid-response:', err?.message || 'aborted');
+      clientRes.destroy();
+    };
+    proxyRes.on('aborted', abandon);
+    proxyRes.on('error', abandon);
     proxyRes.pipe(clientRes, { end: true });
   });
 
   proxy.on('error', (err) => {
     console.error('[wallet-proxy] LNbits error:', err.message);
+    if (clientRes.headersSent) {
+      clientRes.destroy();
+      return;
+    }
     jsonResponse(clientRes, 502, { error: 'LNbits backend unavailable' });
+  });
+
+  proxy.setTimeout(UPSTREAM_TIMEOUT_MS, () => proxy.destroy(new Error('Upstream timeout')));
+  clientReq.on('close', () => {
+    if (!clientRes.writableEnded) proxy.destroy();
   });
 
   if (body) {
@@ -338,7 +424,7 @@ function proxyWalletApi(clientReq, clientRes, proxiedPath, body) {
  * Returns { id, adminkey, name, user, ... } or null if not found.
  */
 function findWalletByPubkey(pubkey) {
-  const db = new DatabaseSync(LNBITS_DB_PATH, { readOnly: true });
+  const db = openDb(LNBITS_DB_PATH, { readOnly: true });
   try {
     const row = db.prepare(`
       SELECT w.id, w.name, w.adminkey, w.inkey, w."user"
@@ -364,6 +450,7 @@ function findWalletByPubkey(pubkey) {
 async function createLnbitsWallet(walletName) {
   const res = await fetch(`${LNBITS_URL}/api/v1/account`, {
     method: 'POST',
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       'X-Api-Key': LNBITS_ADMIN_KEY,
@@ -379,18 +466,35 @@ async function createLnbitsWallet(walletName) {
 }
 
 /**
- * Set username and Nostr pubkey on the LNbits user account.
+ * Link a freshly created LNbits account to its Nostr pubkey.
+ *
+ * This write is what makes the wallet findable again: findWalletByPubkey joins
+ * on accounts.pubkey, so an account that never gets linked is invisible to
+ * every later provision, which would then create a second wallet and strand
+ * the first. Retries, and throws rather than swallowing, so the caller can
+ * refuse to hand out keys for a wallet it cannot find again.
+ *
+ * Username is deliberately not set here: accounts.username is an LNbits login
+ * identifier with no UNIQUE constraint, and the value available at provision
+ * time is an unvalidated client-supplied wallet name. claim-username sets it
+ * properly, against the username rules.
  */
-function updateLnbitsUser(userId, pubkey, username) {
-  const db = new DatabaseSync(LNBITS_DB_PATH);
-  try {
-    db.prepare(`UPDATE accounts SET pubkey = ?, username = ? WHERE id = ?`).run(pubkey, username, userId);
-    console.log(`[provision] updated user ${userId}: pubkey=${pubkey.slice(0, 16)}...`);
-  } catch (e) {
-    console.error(`[provision] failed to update user ${userId}:`, e.message);
-  } finally {
-    db.close();
+function linkWalletToPubkey(userId, pubkey) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const db = openDb(LNBITS_DB_PATH);
+    try {
+      db.prepare('UPDATE accounts SET pubkey = ? WHERE id = ?').run(pubkey, userId);
+      console.log(`[provision] linked user ${userId}: pubkey=${pubkey.slice(0, 16)}...`);
+      return;
+    } catch (e) {
+      lastError = e;
+      console.error(`[provision] link attempt ${attempt}/3 for user ${userId} failed:`, e.message);
+    } finally {
+      db.close();
+    }
   }
+  throw new Error(`PUBKEY_LINK_FAILED: ${lastError?.message}`);
 }
 
 // ── Request handler ──
@@ -476,8 +580,19 @@ const server = createServer(async (req, res) => {
 
         // Create new wallet via LNbits
         const wallet = await createLnbitsWallet(sanitizedName);
-        const username = sanitizedName.replace(/^WoT:/, '').slice(0, 20);
-        updateLnbitsUser(wallet.user, verified.pubkey, username);
+        try {
+          linkWalletToPubkey(wallet.user, verified.pubkey);
+        } catch (e) {
+          // The wallet exists but is not reachable by pubkey. Returning its keys
+          // would let it receive sats that no later provision could ever find.
+          console.error(
+            `[provision] ORPHANED WALLET user=${wallet.user} wallet=${wallet.id} ` +
+            `pubkey=${verified.pubkey} — created but not linked: ${e.message}`
+          );
+          return jsonResponse(res, 503, {
+            error: 'Wallet created but could not be linked to your key. Do not retry; contact the operator.',
+          });
+        }
         return jsonResponse(res, 201, wallet);
       } catch (e) {
         console.error(`[provision] error: ${e.message}`);
@@ -530,8 +645,11 @@ const server = createServer(async (req, res) => {
       }
       _claimingUsernames.add(sanitizedUsername);
 
-      const lnurlpDb = new DatabaseSync(LNURLP_DB_PATH);
+      // Opened inside the try: if this throws, the finally below still releases
+      // the mutex. Opening it before the try leaked the username permanently.
+      let lnurlpDb;
       try {
+        lnurlpDb = openDb(LNURLP_DB_PATH);
         // Check if username is already taken
         const existing = lnurlpDb.prepare('SELECT id FROM pay_links WHERE username = ?').get(sanitizedUsername);
         if (existing) {
@@ -557,12 +675,20 @@ const server = createServer(async (req, res) => {
           '', '', '', '', 255, '', '', sanitizedUsername, 1, DOMAIN, now, now, 0
         );
 
-        // Update account username
-        const mainDb = new DatabaseSync(LNBITS_DB_PATH);
+        // Update account username. These two writes live in different database
+        // files and cannot share a transaction, so if this one fails we undo the
+        // pay link rather than leaving a live Lightning Address behind a 500.
         try {
-          mainDb.prepare('UPDATE accounts SET username = ? WHERE id = ?').run(sanitizedUsername, wallet.user);
-        } finally {
-          mainDb.close();
+          const mainDb = openDb(LNBITS_DB_PATH);
+          try {
+            mainDb.prepare('UPDATE accounts SET username = ? WHERE id = ?').run(sanitizedUsername, wallet.user);
+          } finally {
+            mainDb.close();
+          }
+        } catch (e) {
+          lnurlpDb.prepare('DELETE FROM pay_links WHERE id = ?').run(payLinkId);
+          console.error(`[claim-username] rolled back pay link ${payLinkId}:`, e.message);
+          throw e;
         }
 
         return jsonResponse(res, 200, { address: `${sanitizedUsername}@${DOMAIN}`, payLinkId });
@@ -570,7 +696,7 @@ const server = createServer(async (req, res) => {
         console.error(`[claim-username] error:`, e.message);
         return jsonResponse(res, 500, { error: 'Failed to create Lightning Address' });
       } finally {
-        lnurlpDb.close();
+        lnurlpDb?.close();
         _claimingUsernames.delete(sanitizedUsername);
       }
     }
@@ -587,7 +713,7 @@ const server = createServer(async (req, res) => {
         return jsonResponse(res, 200, { address: null });
       }
 
-      const lnurlpDb = new DatabaseSync(LNURLP_DB_PATH, { readOnly: true });
+      const lnurlpDb = openDb(LNURLP_DB_PATH, { readOnly: true });
       try {
         const link = lnurlpDb.prepare('SELECT username FROM pay_links WHERE wallet = ?').get(wallet.id);
         if (link && link.username) {
@@ -625,7 +751,7 @@ const server = createServer(async (req, res) => {
         return jsonResponse(res, 404, { error: 'No wallet found for this pubkey' });
       }
 
-      const lnurlpDb = new DatabaseSync(LNURLP_DB_PATH);
+      const lnurlpDb = openDb(LNURLP_DB_PATH);
       try {
         const link = lnurlpDb.prepare('SELECT id, username FROM pay_links WHERE wallet = ?').get(wallet.id);
         if (!link) {
@@ -634,7 +760,7 @@ const server = createServer(async (req, res) => {
 
         lnurlpDb.prepare('DELETE FROM pay_links WHERE id = ?').run(link.id);
 
-        const mainDb = new DatabaseSync(LNBITS_DB_PATH);
+        const mainDb = openDb(LNBITS_DB_PATH);
         try {
           mainDb.prepare('UPDATE accounts SET username = NULL WHERE id = ?').run(wallet.user);
         } finally {
@@ -652,6 +778,9 @@ const server = createServer(async (req, res) => {
 
     // Only proxy allowlisted LNURL paths (GET only), everything else is 404
     if (req.method === 'GET' && PROXY_ALLOWLIST.some(re => re.test(parsedUrl.pathname))) {
+      if (!checkRateLimit(clientIp, 'lnurl')) {
+        return jsonResponse(res, 429, { error: 'Too many requests' });
+      }
       // Use parsedUrl.pathname (normalized) instead of raw req.url
       let proxyPath = parsedUrl.pathname + parsedUrl.search;
       // NIP-57 fix (issue #8): some clients double-URL-encode the `nostr` zap
@@ -682,15 +811,28 @@ const server = createServer(async (req, res) => {
     // Wallet API proxy (requires X-Api-Key, supports GET/POST)
     if ((req.method === 'GET' || req.method === 'POST') &&
         WALLET_API_ALLOWLIST.some(re => re.test(parsedUrl.pathname))) {
+      if (!checkRateLimit(clientIp, 'wallet')) {
+        return jsonResponse(res, 429, { error: 'Too many requests' });
+      }
       if (!req.headers['x-api-key']) {
         return jsonResponse(res, 401, { error: 'Missing X-Api-Key header' });
       }
+      // LNbits also accepts ?api-key=<key>. Allowing it here would write wallet
+      // keys into our logs and nginx's, so require the header form only.
+      if (parsedUrl.searchParams.has('api-key')) {
+        return jsonResponse(res, 400, { error: 'Pass the wallet key in the X-Api-Key header, not the query string' });
+      }
       const proxyPath = parsedUrl.pathname + parsedUrl.search;
-      if (req.method === 'POST') {
-        const body = await readBody(req);
-        proxyWalletApi(req, res, proxyPath, body);
-      } else {
-        proxyWalletApi(req, res, proxyPath, null);
+      try {
+        if (req.method === 'POST') {
+          const body = await readBody(req);
+          proxyWalletApi(req, res, proxyPath, body);
+        } else {
+          proxyWalletApi(req, res, proxyPath, null);
+        }
+      } catch (e) {
+        if (e.message === 'BODY_TOO_LARGE') return jsonResponse(res, 413, { error: 'Request body too large' });
+        throw e;
       }
       return;
     }

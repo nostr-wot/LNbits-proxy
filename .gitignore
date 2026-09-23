@@ -3,3 +3,15 @@ node_modules/
 .DS_Store
 *.log
 .env
+
+# Operational artefacts that must never be committed
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.bak-*
+*.before-*
+state.json
+worktrees/
