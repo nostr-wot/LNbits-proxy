@@ -4,6 +4,7 @@
 // Cron health check for zaps.nostr-wot.com Lightning stack
 // Zero npm dependencies — uses Node built-ins only
 
+import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, statSync, renameSync, appendFileSync } from 'node:fs';
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -18,6 +19,17 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_FROM     = process.env.EMAIL_FROM || 'Zaps Monitor <alarms@dandelionlabs.io>';
 const EMAIL_TO       = process.env.EMAIL_TO   || 'leon@nostr-wot.com';
 const PHOENIX_CONF   = process.env.PHOENIX_CONF || '/home/phoenixd/.phoenix/phoenix.conf';
+
+// End-to-end check. It mints a real invoice on every run, so it needs its own
+// address, a short expiry, and the cleanup helper to retire what it created.
+const BASE_URL       = process.env.MONITOR_BASE_URL || 'https://zaps.nostr-wot.com';
+const MONITOR_ADDRESS = process.env.MONITOR_ADDRESS || 'robert';
+// Lightning Addresses to probe for reachability, comma separated.
+const LNURL_NAMES    = (process.env.MONITOR_LNURL_NAMES || 'robert,leon')
+  .split(',').map(n => n.trim()).filter(Boolean);
+const INVOICE_EXPIRY = process.env.MONITOR_INVOICE_EXPIRY || '30';
+const CLEANUP_BIN    = process.env.MONITOR_CLEANUP || '/srv/zaps-monitor/cleanup.py';
+const PYTHON_BIN     = process.env.MONITOR_PYTHON || '/usr/bin/python3';
 
 if (!RESEND_API_KEY) {
   console.error('RESEND_API_KEY env var is required');
@@ -81,7 +93,7 @@ async function checkProvision() {
 }
 
 async function checkLnurl(name) {
-  const r = await f(`https://zaps.nostr-wot.com/.well-known/lnurlp/${name}`);
+  const r = await f(`${BASE_URL}/.well-known/lnurlp/${name}`);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
   if (!d.callback) throw new Error('no callback in response');
@@ -107,21 +119,34 @@ async function checkPhoenixd() {
 
 async function checkCallbackE2E() {
   // Step 1: get LNURL metadata
-  const r = await f('https://zaps.nostr-wot.com/.well-known/lnurlp/robert');
+  const r = await f(`${BASE_URL}/.well-known/lnurlp/${MONITOR_ADDRESS}`);
   if (!r.ok) throw new Error(`LNURL fetch HTTP ${r.status}`);
   const d = await r.json();
   if (!d.callback) throw new Error('no callback URL');
 
-  // Step 2: request a minimum-amount invoice
+  // Step 2: request a minimum-amount, short-lived invoice
   const amount = d.minSendable || 1000; // millisats
   const url = new URL(d.callback);
   url.searchParams.set('amount', String(amount));
+  url.searchParams.set('expiry', INVOICE_EXPIRY);
   const ir = await f(url.toString());
   if (!ir.ok) throw new Error(`callback HTTP ${ir.status}`);
   const inv = await ir.json();
   if (!inv.pr) throw new Error('no payment request in response');
   if (!inv.pr.startsWith('lnbc')) throw new Error(`bad invoice prefix: ${inv.pr.slice(0, 8)}`);
-  return `invoice OK (${inv.pr.slice(0, 20)}…)`;
+
+  // Step 3: retire what we just minted. Without this the check leaves ~288
+  // unpaid invoices a day in LNbits and the backend, and fills the monitored
+  // account's payment history with invoices nobody will ever pay. cleanup.py
+  // only retires after the backend confirms the invoice was not paid.
+  const retired = spawnSync(PYTHON_BIN, [CLEANUP_BIN, '--retire-monitor'], {
+    input: inv.pr, encoding: 'utf8', timeout: 30000,
+  });
+  if (retired.error || retired.status !== 0)
+    throw new Error('invoice generated, but monitor retirement failed; retained for cleanup');
+  const result = JSON.parse(retired.stdout);
+  if (result.retired !== 1) throw new Error('monitor retirement not confirmed');
+  return `invoice OK; ${INVOICE_EXPIRY}s expiry; retired locally`;
 }
 
 // ── Alerting ────────────────────────────────────────────────────────────────
@@ -152,8 +177,9 @@ async function sendEmail(subject, body) {
 const CHECKS = [
   { id: 'lnbits',       label: 'LNbits Health',       fn: checkLnbits },
   { id: 'provision',    label: 'Zaps Provision',       fn: checkProvision },
-  { id: 'lnurl_robert', label: 'LNURL robert',        fn: () => checkLnurl('robert') },
-  { id: 'lnurl_leon',   label: 'LNURL leon',          fn: () => checkLnurl('leon') },
+  ...LNURL_NAMES.map(name => (
+    { id: `lnurl_${name}`, label: `LNURL ${name}`, fn: () => checkLnurl(name) }
+  )),
   { id: 'phoenixd',     label: 'Phoenixd Node',        fn: checkPhoenixd },
   { id: 'callback_e2e', label: 'LNURL Callback E2E',   fn: checkCallbackE2E },
 ];
