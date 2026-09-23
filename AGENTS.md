@@ -1,7 +1,8 @@
 # LNbits-proxy
 
-This repository owns the provisioning service at `zaps.nostr-wot.com`, deployed to
-`/srv/zaps-provision` on `root@the origin host` as PM2 app `zaps-provision`.
+This repository owns the provisioning service at `zaps.nostr-wot.com`. Host details,
+deploy paths and credentials live outside this public repository; see the private ops
+notes. Deploy with `./deploy.sh`, never by copying files onto the box by hand.
 The extension UI/client lives in [nostr-wot-extension](https://github.com/nostr-wot/nostr-wot-extension)
 and its [AGENTS.md](../nostr-wot-extension/AGENTS.md). Keep this API contract and the
 extension's wallet documentation/tests in sync. Do not duplicate server code there.
@@ -22,5 +23,6 @@ extension's wallet documentation/tests in sync. Do not duplicate server code the
   in tests. Use isolated empty wallets for live connection checks and revoke test grants.
 - Compare live `server.js` with Git before deploy. Preserve the existing NIP-57
   double-encoded zap-request fix; production previously contained this untracked change.
-- Read [README.md](README.md) for endpoints, deployment and limitations. Never commit
-  `.env`, wallet databases, credentials, or generated operational backups.
+- Read [README.md](README.md) for endpoints and configuration, and [RUNBOOK.md](RUNBOOK.md)
+  when something is broken. Never commit `.env`, wallet databases, credentials, generated
+  operational backups, or host addresses: this repository is public.

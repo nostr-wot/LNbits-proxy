@@ -33,6 +33,7 @@
 
 import { createServer, request as httpRequest } from 'node:http';
 import { createNwcRoutes } from './nwc-connections.mjs';
+import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { verifyEvent } from 'nostr-tools/pure';
@@ -60,6 +61,10 @@ const UPSTREAM_TIMEOUT_MS = 30_000;
  * statement throw SQLITE_BUSY. Every caller here shares live LNbits databases.
  */
 function openDb(path, options = {}) {
+  // node:sqlite creates an empty file when the path does not exist, so a typo in
+  // a configured path turns into "no such table" on every request plus a stray
+  // database on disk. Refuse instead.
+  if (!existsSync(path)) throw new Error(`Database not found: ${path}`);
   const db = new DatabaseSync(path, options);
   try {
     db.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS}`);
@@ -837,6 +842,39 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // GET /healthz — what an operator or an uptime check should look at.
+    // Exercises the real dependencies rather than reporting that the process is
+    // merely alive, which pm2 already claims even when every request 500s.
+    if (req.method === 'GET' && parsedUrl.pathname === '/healthz') {
+      const checks = {};
+      let healthy = true;
+      for (const [name, path] of [['lnbitsDb', LNBITS_DB_PATH], ['lnurlpDb', LNURLP_DB_PATH]]) {
+        try {
+          const db = openDb(path, { readOnly: true });
+          try {
+            db.prepare('SELECT 1').get();
+            checks[name] = 'ok';
+          } finally { db.close(); }
+        } catch (e) {
+          checks[name] = `error: ${e.message}`;
+          healthy = false;
+        }
+      }
+      checks.adminKey = LNBITS_ADMIN_KEY ? 'set' : 'missing';
+      if (!LNBITS_ADMIN_KEY) healthy = false;
+      try {
+        const upstream = await fetch(`${LNBITS_URL}/api/v1/health`, {
+          signal: AbortSignal.timeout(5_000),
+        });
+        checks.lnbits = upstream.ok ? 'ok' : `HTTP ${upstream.status}`;
+        if (!upstream.ok) healthy = false;
+      } catch (e) {
+        checks.lnbits = `unreachable: ${e.message}`;
+        healthy = false;
+      }
+      return jsonResponse(res, healthy ? 200 : 503, { ok: healthy, checks });
+    }
+
     jsonResponse(res, 404, { error: 'Not found' });
   } catch (e) {
     console.error('[server] unhandled error:', e);
@@ -846,9 +884,18 @@ const server = createServer(async (req, res) => {
   }
 });
 
+// Fail at startup rather than reporting "online" while every request 500s.
+const startupProblems = [];
+if (!LNBITS_ADMIN_KEY) startupProblems.push('LNBITS_ADMIN_KEY is not set');
+for (const [label, path] of [['LNBITS_DB_PATH', LNBITS_DB_PATH], ['LNURLP_DB_PATH', LNURLP_DB_PATH]]) {
+  if (!existsSync(path)) startupProblems.push(`${label} does not exist: ${path}`);
+}
+if (startupProblems.length) {
+  for (const problem of startupProblems) console.error(`[zaps-provision] FATAL: ${problem}`);
+  console.error('[zaps-provision] refusing to start misconfigured');
+  process.exit(1);
+}
+
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[zaps-provision] listening on 127.0.0.1:${PORT}`);
-  if (!LNBITS_ADMIN_KEY) {
-    console.warn('[zaps-provision] WARNING: LNBITS_ADMIN_KEY not set — provisioning will fail');
-  }
 });
