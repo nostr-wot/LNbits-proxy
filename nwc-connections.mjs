@@ -11,7 +11,11 @@ export function createNwcRoutes({backend,dbPath,fetchFn=fetch}) {
   const upstream=async(key,path,method='GET',body)=>{
     const response=await fetchFn(`${backend}${path}`,{method,redirect:'error',signal:AbortSignal.timeout(15000),headers:{'X-Api-Key':key,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});
     if(!response.ok) {const e=new Error('LNbits rejected request');e.status=response.status;throw e;}
-    return response.json();
+    // A non-JSON 2xx (an nginx error page, an empty body) is a backend fault, not
+    // a client one. Without this it surfaced as a SyntaxError and was reported
+    // to the caller as 400, so clients would not retry.
+    try {return await response.json();}
+    catch {const e=new Error('Invalid upstream response');e.status=502;throw e;}
   };
   const handle = async function nwcRoutes(req,res,url) {
     if(url.pathname!==basePath&&!url.pathname.startsWith(`${basePath}/`)) return false;
@@ -23,6 +27,9 @@ export function createNwcRoutes({backend,dbPath,fetchFn=fetch}) {
       const key=req.headers['x-api-key'];
       if(typeof key!=='string'||key.length>256) {send(res,401,{error:'Wallet Admin API key required'});return true;}
       const db=new DatabaseSync(dbPath);
+      // node:sqlite defaults to no busy timeout, so a concurrent LNbits write
+      // makes the next statement throw SQLITE_BUSY immediately.
+      db.exec('PRAGMA busy_timeout = 5000');
       let wallet;
       try {
         wallet=db.prepare('SELECT id,user FROM wallets WHERE adminkey=? AND deleted=0').get(key);
@@ -33,9 +40,18 @@ export function createNwcRoutes({backend,dbPath,fetchFn=fetch}) {
         if(!enabled?.active) {send(res,503,{error:'NWC Provider is unavailable'});return true;}
         const userExtension=db.prepare("SELECT active FROM extensions WHERE user=? AND extension='nwcprovider'").get(wallet.user);
         if(req.method==='PUT') {
-          let body='',size=0;
-          for await(const chunk of req) {size+=chunk.length;if(size>4096){send(res,413,{error:'Request too large'});return true;}body+=chunk;}
-          const input=JSON.parse(body);
+          // Collect Buffers and decode once: `body+=chunk` decoded each chunk
+          // separately and corrupted any multi-byte character split across two.
+          // Keep draining past the limit instead of breaking, because breaking
+          // out of `for await` destroys the request before the 413 can be sent.
+          const chunks=[];let size=0,tooLarge=false;
+          for await(const chunk of req) {
+            size+=chunk.length;
+            if(size>4096){tooLarge=true;if(size>16384){req.destroy();break;}continue;}
+            chunks.push(chunk);
+          }
+          if(tooLarge){send(res,413,{error:'Request too large'});return true;}
+          const input=JSON.parse(Buffer.concat(chunks).toString());
           if(typeof input.name!=='string'||!input.name.trim()||input.name.trim().length>50||[...input.name].some(c=>c.charCodeAt(0)<32||c.charCodeAt(0)===127)
              ||!Number.isSafeInteger(input.dailyLimit)||input.dailyLimit<=0||input.dailyLimit>=10000000
              ||!Number.isSafeInteger(input.days)||input.days<1||input.days>365) {send(res,400,{error:'Invalid connection settings'});return true;}
@@ -44,6 +60,12 @@ export function createNwcRoutes({backend,dbPath,fetchFn=fetch}) {
           const existing=await upstream(key,'/nwcprovider/api/v1/nwc');
           if(existing.some(row=>row.data.pubkey===pubkey)) {send(res,200,{ok:true});return true;}
           if(existing.length>=50) {send(res,409,{error:'Maximum active connections reached'});return true;}
+          // Expired grants are hidden from the default listing but the provider
+          // keys table has pubkey as PRIMARY KEY, so re-registering one would
+          // fail the insert forever. Clear the stale row first; DELETE upstream
+          // is wallet-scoped and idempotent.
+          const all=await upstream(key,'/nwcprovider/api/v1/nwc?include_expired=true');
+          if(all.some(row=>row.data.pubkey===pubkey)) await upstream(key,`/nwcprovider/api/v1/nwc/${pubkey}`,'DELETE');
           const now=Math.floor(Date.now()/1000);
           await upstream(key,`/nwcprovider/api/v1/nwc/${pubkey}`,'PUT',{
             description:input.name.trim(),expires_at:now+input.days*86400,permissions:['pay','lookup','info'],
@@ -66,6 +88,8 @@ export function createNwcRoutes({backend,dbPath,fetchFn=fetch}) {
       } finally {db.close();}
     } catch(e) {
       // Never return upstream exception text (could contain credentials or payloads).
+      // Log enough to diagnose a wave of 502s without recording the key or body.
+      console.error(`[nwc] ${req.method} ${url.pathname} status=${e.status??'-'} ${e.message}`);
       send(res,e instanceof SyntaxError?400:(e.status===401||e.status===403?e.status:502),{error:'Unable to manage NWC connections. Refresh before trying again.'});
       return true;
     }
