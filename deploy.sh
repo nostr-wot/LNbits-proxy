@@ -81,9 +81,30 @@ run npm --prefix "$PROVISION_DIR" ci --omit=dev --silent
 
 say "Installing the monitor into $MONITOR_DIR"
 run mkdir -p "$MONITOR_DIR"
-run install -m 0755 monitor/monitor.mjs "$MONITOR_DIR/monitor.mjs"
-run install -m 0755 monitor/cleanup.py "$MONITOR_DIR/cleanup.py"
-run install -m 0755 monitor/run-monitor.sh "$MONITOR_DIR/run-monitor.sh"
+# Install every runtime file the monitor imports, rather than naming them one by
+# one: a previous version listed the files individually and silently shipped a
+# monitor whose imports were missing, which the post-deploy check caught.
+for f in monitor/*.mjs monitor/*.py monitor/*.sh; do
+  case "$f" in
+    monitor/test_*) continue ;;          # tests are run from the checkout
+  esac
+  case "$f" in
+    *.sh|*.py) mode=0755 ;;
+    *)         mode=0644 ;;
+  esac
+  case "$f" in
+    monitor/monitor.mjs) mode=0755 ;;    # entry point
+  esac
+  run install -m "$mode" "$f" "$MONITOR_DIR/$(basename "$f")"
+done
+
+# Fail loudly if the installed monitor cannot even load its own imports.
+if [ "$DRY_RUN" -eq 0 ]; then
+  if ! node --check "$MONITOR_DIR/monitor.mjs" >/dev/null 2>&1; then
+    echo "  ERROR: installed monitor.mjs does not parse" >&2
+    exit 1
+  fi
+fi
 
 # The monitor refuses to run unconfigured, so a missing env file would silence
 # monitoring on the next cron tick rather than failing loudly here.
