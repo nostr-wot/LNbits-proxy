@@ -5,6 +5,7 @@
 // Zero npm dependencies — uses Node built-ins only
 
 import { spawnSync } from 'node:child_process';
+import { decide } from './alert-policy.mjs';
 import { readFileSync, writeFileSync, statSync, renameSync, appendFileSync } from 'node:fs';
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -13,6 +14,12 @@ const STATE_FILE     = process.env.STATE_FILE || '/srv/zaps-monitor/state.json';
 const LOG_FILE       = process.env.LOG_FILE   || '/srv/zaps-monitor/monitor.log';
 const MAX_LOG_BYTES  = 10 * 1024 * 1024; // 10 MB
 const REMINDER_MS    = 60 * 60 * 1000;   // 60 min
+// Consecutive failures required before alerting. Three of these checks go
+// through the public edge, so a brief network hiccup used to fire three alerts
+// at once and three recoveries five minutes later.
+const ALERT_AFTER    = Math.max(1, Number(process.env.MONITOR_ALERT_AFTER || 2));
+// Overridable so the alerting behaviour can be tested without sending mail.
+const RESEND_URL     = process.env.RESEND_URL || 'https://api.resend.com/emails';
 const TIMEOUT_MS     = 10_000;
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -153,7 +160,7 @@ async function checkCallbackE2E() {
 
 async function sendEmail(subject, body) {
   try {
-    const r = await fetch('https://api.resend.com/emails', {
+    const r = await fetch(RESEND_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${RESEND_API_KEY}`,
@@ -197,41 +204,26 @@ async function main() {
   }
 
   for (const r of results) {
-    const prev = state[r.id] || { ok: true, since: null, lastReminder: null };
+    const { state: next, email } = decide(state[r.id], r.ok, now, {
+      alertAfter: ALERT_AFTER, reminderMs: REMINDER_MS,
+    });
+    state[r.id] = next;
 
-    if (r.ok && !prev.ok) {
-      // ── Recovery ──
-      const mins = prev.since ? Math.round((now - prev.since) / 60000) : '?';
+    if (email?.kind === 'recovered') {
       await sendEmail(
         `RECOVERED: ${r.label}`,
-        `${r.label} has recovered.\n\nDowntime: ~${mins} minutes\nDetail: ${r.msg}\nTime: ${new Date().toISOString()}`
+        `${r.label} has recovered.\n\nDowntime: ~${email.minutes} minutes\nDetail: ${r.msg}\nTime: ${new Date().toISOString()}`
       );
-      state[r.id] = { ok: true, since: null, lastReminder: null };
-
-    } else if (!r.ok && prev.ok) {
-      // ── New failure ──
+    } else if (email?.kind === 'alert') {
       await sendEmail(
         `ALERT: ${r.label} failing`,
-        `${r.label} is failing!\n\nError: ${r.msg}\nTime: ${new Date().toISOString()}`
+        `${r.label} is failing!\n\nError: ${r.msg}\nConsecutive failures: ${email.fails}\nTime: ${new Date().toISOString()}`
       );
-      state[r.id] = { ok: false, since: now, lastReminder: now };
-
-    } else if (!r.ok && !prev.ok) {
-      // ── Still failing — remind every 60 min ──
-      if (now - (prev.lastReminder || 0) >= REMINDER_MS) {
-        const mins = prev.since ? Math.round((now - prev.since) / 60000) : '?';
-        await sendEmail(
-          `STILL FAILING: ${r.label} (${mins} min)`,
-          `${r.label} is still failing.\n\nError: ${r.msg}\nDowntime: ~${mins} minutes\nTime: ${new Date().toISOString()}`
-        );
-        state[r.id] = { ...prev, lastReminder: now };
-      } else {
-        state[r.id] = prev;
-      }
-
-    } else {
-      // ── Still OK ──
-      state[r.id] = { ok: true, since: null, lastReminder: null };
+    } else if (email?.kind === 'reminder') {
+      await sendEmail(
+        `STILL FAILING: ${r.label} (${email.minutes} min)`,
+        `${r.label} is still failing.\n\nError: ${r.msg}\nDowntime: ~${email.minutes} minutes\nTime: ${new Date().toISOString()}`
+      );
     }
   }
 

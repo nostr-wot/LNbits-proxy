@@ -16,7 +16,7 @@ The existing email monitor (`monitor.mjs`) detects this and alerts, but doesn't 
 4. Waits 10 seconds after restart, then verifies the API is back
 5. All events logged to syslog under tag `phoenixd-monitor`
 
-## Files on server (46.225.78.116)
+## Files on the server
 
 | File | Purpose |
 |------|---------|
