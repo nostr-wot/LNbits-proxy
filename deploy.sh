@@ -120,6 +120,26 @@ run install -m 0644 monitor/check-phoenixd.timer /etc/systemd/system/check-phoen
 run systemctl daemon-reload
 run systemctl enable --now check-phoenixd.timer
 
+say "Migrating the pubkey to wallet mapping"
+# This MUST happen before the new code starts serving. The proxy resolves
+# wallets from its own table now; if that table were empty when the new code
+# went live, every returning user would look unprovisioned and be given a NEW
+# wallet, stranding the funds in their old one. The script is idempotent and
+# verifies that every pubkey still resolves to exactly the wallet it did before,
+# exiting non-zero if even one does not.
+if [ -f scripts/backfill-provisioned.mjs ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    run node scripts/backfill-provisioned.mjs --dry-run
+  else
+    if ! PROVISION_DB_PATH="${PROVISION_DB_PATH:-$PROVISION_DIR/provisioning.sqlite3}" \
+         node scripts/backfill-provisioned.mjs; then
+      echo "  ABORTING: mapping migration failed verification; $PM2_APP was NOT restarted" >&2
+      exit 1
+    fi
+    chmod 600 "${PROVISION_DB_PATH:-$PROVISION_DIR/provisioning.sqlite3}" 2>/dev/null || true
+  fi
+fi
+
 say "Restarting $PM2_APP only"
 # Deliberately not LNbits or phoenixd: a proxy change never needs those bounced.
 run pm2 restart "$PM2_APP" --update-env
@@ -147,6 +167,16 @@ check "public challenge"    200 "$BASE_URL/api/provision/challenge"
 check "wallet auth (no key)" 401 "$BASE_URL/api/v1/wallet"
 check "nwc (no key)"         401 "$BASE_URL/api/nwc/connections"
 check "unknown path"         404 "$BASE_URL/api/nope"
+
+if [ -f scripts/backfill-provisioned.mjs ]; then
+  if PROVISION_DB_PATH="${PROVISION_DB_PATH:-$PROVISION_DIR/provisioning.sqlite3}" \
+     node scripts/backfill-provisioned.mjs --verify-only >/dev/null 2>&1; then
+    printf '  ok    %-34s every pubkey resolves as before\n' "wallet mapping"
+  else
+    printf '  FAIL  %-34s verification failed\n' "wallet mapping"
+    fail=1
+  fi
+fi
 
 if [ -x "$MONITOR_DIR/run-monitor.sh" ] && [ -r "$MONITOR_DIR/zaps-monitor.env" ]; then
   if MONITOR_ENV_FILE="$MONITOR_DIR/zaps-monitor.env" "$MONITOR_DIR/run-monitor.sh" >/dev/null 2>&1; then

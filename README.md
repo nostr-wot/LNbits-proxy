@@ -106,10 +106,35 @@ Copy `.env.example`. Only `LNBITS_ADMIN_KEY` is required.
 | `LNBITS_ADMIN_KEY` | *(required)* | LNbits super-user key, never forwarded to clients |
 | `LNBITS_DB_PATH` | `/home/lnbits/lnbits/data/database.sqlite3` | LNbits database |
 | `LNURLP_DB_PATH` | `/home/lnbits/lnbits/data/ext_lnurlp.sqlite3` | lnurlp extension database |
+| `PROVISION_DB_PATH` | `/srv/zaps-provision/provisioning.sqlite3` | Proxy-owned pubkey to wallet mapping |
 | `PORT` | `3003` | Loopback listen port |
 
 The service binds `127.0.0.1` only and refuses to start if a database path does not exist
 or the admin key is missing, rather than coming up and failing every request.
+
+### Who owns which wallet
+
+Provisioning resolves a Nostr pubkey to a wallet through `PROVISION_DB_PATH`, a database
+this service owns. It is written only after a NIP-98 signature from that pubkey has been
+verified.
+
+It deliberately does not use LNbits' `accounts.pubkey`. LNbits lets any logged-in user set
+that column on their own account with no proof they hold the Nostr key, so anyone able to
+reach LNbits could claim an unclaimed npub and be handed the wallet that npub later
+provisions. The column is still mirrored for LNbits' own UI, but never read for
+authorization. **Keep this file unwritable by the LNbits user** — that is the whole
+protection.
+
+Migrating an existing instance:
+
+```bash
+node scripts/backfill-provisioned.mjs --dry-run
+node scripts/backfill-provisioned.mjs     # copies, then verifies every pubkey
+```
+
+It is idempotent and verifies that each pubkey still resolves to the same wallet, with the
+same keys, as before. `deploy.sh` runs it before restarting and aborts if verification
+fails.
 
 > **The public domain is a constant in `server.js`, not an environment variable.** NIP-98
 > rejects any event whose `u` tag does not match it exactly, so an unmodified copy refuses
