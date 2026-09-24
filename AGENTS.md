@@ -9,7 +9,10 @@ extension's wallet documentation/tests in sync. Do not duplicate server code the
 
 - Author commits solely as the user. No AI attribution, signer or co-author trailers.
 - Work in a dedicated worktree; keep the main clone clean and fast-forward it after merge.
-- Use Node 24+. Run `npm ci`, `npm test`, and `node --check server.js` before committing.
+- Use Node 24+. Run `npm ci`, `npm test`, `npm run test:cleanup` and `npm run check`
+  before committing.
+- Resolve wallet ownership through `PROVISION_DB_PATH` only. Never authorize from
+  LNbits' `accounts.pubkey`: any logged-in LNbits user can set it on their own account.
 - NWC management is wallet-scoped. Require the wallet Admin API key, never the instance
   administrator credential from a client. Retain LNbits account/extension restrictions.
 - Generate NWC client secrets in the extension. Never send them to this proxy, log
@@ -17,12 +20,11 @@ extension's wallet documentation/tests in sync. Do not duplicate server code the
   pairing lookup stays on loopback and only returns public provider/relay information.
 - New connections grant pay/lookup/info only, with positive daily budgets and expiry.
   Revoke only the authenticated wallet's connection; do not retry payment requests.
-- Production changes require a dated backup and syntax/tests before restarting only
-  `zaps-provision`. Check public challenge, wallet auth and NWC management afterward.
-  Do not restart LNbits or Phoenixd for proxy-only changes. Never use customer funds
-  in tests. Use isolated empty wallets for live connection checks and revoke test grants.
-- Compare live `server.js` with Git before deploy. Preserve the existing NIP-57
-  double-encoded zap-request fix; production previously contained this untracked change.
+- Deploy with `./deploy.sh`, which backs up, migrates the wallet mapping, restarts only
+  `zaps-provision` and verifies. Do not restart LNbits or phoenixd for proxy-only changes.
+  Never use customer funds in tests: use isolated empty wallets and revoke test grants.
+- Preserve the NIP-57 double-encoded zap-request handling in the LNURL passthrough;
+  without it lnurlp fails to publish the kind:9735 receipt.
 - Read [README.md](README.md) for endpoints and configuration, and [RUNBOOK.md](RUNBOOK.md)
   when something is broken. Never commit `.env`, wallet databases, credentials, generated
   operational backups, or host addresses: this repository is public.
