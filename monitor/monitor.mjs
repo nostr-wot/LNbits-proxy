@@ -4,6 +4,7 @@
 // Cron health check for zaps.nostr-wot.com Lightning stack
 // Zero npm dependencies — uses Node built-ins only
 
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { decide } from './alert-policy.mjs';
 import { readFileSync, writeFileSync, statSync, renameSync, appendFileSync } from 'node:fs';
@@ -92,11 +93,14 @@ async function checkLnbits() {
 }
 
 async function checkProvision() {
-  const r = await f('http://127.0.0.1:3003/api/provision/challenge');
+  const r = await f('http://127.0.0.1:3003/api/v2/provision/challenge', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({url:`${BASE_URL}/api/v2/release-username`,method:'POST',payload:createHash('sha256').update('{}').digest('hex')}),
+  });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
-  if (!d.challenge) throw new Error('no challenge in response');
-  return `challenge OK (${d.challenge.slice(0, 8)}…)`;
+  if (d.version !== 2 || !/^[0-9a-f]{64}$/.test(d.challenge) || !/^[0-9a-f]{64}$/.test(d.transactionToken)) throw new Error('invalid v2 challenge response');
+  return 'v2 challenge OK';
 }
 
 async function checkLnurl(name) {

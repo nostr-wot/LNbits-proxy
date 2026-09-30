@@ -9,11 +9,11 @@
  * If so, returns the existing wallet. Otherwise creates a new one.
  *
  * Endpoints:
- *   GET  /api/provision/challenge  - Generate a random challenge
- *   POST /api/provision            - Verify signed event, create or recover wallet
- *   POST /api/claim-username       - Claim a Lightning Address username
+ *   POST /api/v2/provision/challenge - Issue a body-bound transaction
+ *   POST /api/v2/provision            - Verify signed event, create or recover wallet
+ *   POST /api/v2/claim-username       - Claim a Lightning Address username
  *   GET  /api/lightning-address    - Look up Lightning Address by pubkey
- *   POST /api/release-username     - Release a claimed Lightning Address
+ *   POST /api/v2/release-username     - Release a claimed Lightning Address
  *
  * Proxied LNURL paths (GET-only, needed for LNURL callbacks):
  *   GET /.well-known/lnurlp/:username
@@ -37,7 +37,7 @@ import { createNwcRoutes } from './nwc-connections.mjs';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { verifyEvent } from 'nostr-tools/pure';
+import { createAuth, publicOrigin, allowedOrigins, clientScope, AUTH_PATHS, CHALLENGE_PATH } from './auth-v2.mjs';
 
 const LNBITS_URL = process.env.LNBITS_URL || 'http://127.0.0.1:5000';
 const LNBITS_ADMIN_KEY = process.env.LNBITS_ADMIN_KEY;
@@ -51,11 +51,10 @@ const LNURLP_DB_PATH = process.env.LNURLP_DB_PATH || '/home/lnbits/lnbits/data/e
 const PROVISION_DB_PATH = process.env.PROVISION_DB_PATH || '/srv/zaps-provision/provisioning.sqlite3';
 const nwcRoutes = createNwcRoutes({backend:LNBITS_URL,dbPath:LNBITS_DB_PATH});
 const PORT = parseInt(process.env.PORT || '3003', 10);
-const CHALLENGE_TTL_MS = 60_000; // 60 seconds
-const CHALLENGE_MAX = 10_000;
-const EVENT_MAX_AGE_S = 60;      // 60 seconds
-const DOMAIN = 'zaps.nostr-wot.com';
-const BASE_URL = `https://${DOMAIN}`;
+const BASE_URL = publicOrigin(process.env.PUBLIC_ORIGIN || 'https://zaps.nostr-wot.com');
+const DOMAIN = new URL(BASE_URL).host;
+const BROWSER_ORIGINS = allowedOrigins(process.env.BROWSER_ORIGINS);
+const auth = createAuth({dbPath: PROVISION_DB_PATH, publicOrigin: BASE_URL});
 const MAX_BODY_BYTES = 65_536;   // 64KB body limit
 const WALLET_NAME_MAX = 50;
 const PUBKEY_RE = /^[0-9a-f]{64}$/;
@@ -173,18 +172,6 @@ const _rlCleanup = setInterval(() => {
 }, 300_000);
 _rlCleanup.unref();
 
-// In-memory challenge store: challenge -> timestamp
-const challenges = new Map();
-
-// Cleanup expired challenges every 30s
-const _chCleanup = setInterval(() => {
-  const now = Date.now();
-  for (const [ch, ts] of challenges) {
-    if (now - ts > CHALLENGE_TTL_MS) challenges.delete(ch);
-  }
-}, 30_000);
-_chCleanup.unref();
-
 // In-memory mutex sets to prevent race conditions on provisioning/claiming
 const _provisioningPubkeys = new Set();
 const _claimingUsernames = new Set();
@@ -237,7 +224,7 @@ function readBody(req) {
       chunks.push(c);
     });
     req.on('end', () => {
-      if (!tooLarge) resolve(Buffer.concat(chunks).toString());
+      if (!tooLarge) resolve(Buffer.concat(chunks));
     });
     req.on('error', reject);
   });
@@ -247,86 +234,6 @@ function readBody(req) {
 function sanitizeString(str) {
   // eslint-disable-next-line no-control-regex
   return str.replace(/[\x00-\x1f\x7f]/g, '');
-}
-
-/**
- * Verify a NIP-98 kind:27235 event from a request body.
- * Validates signature FIRST, then consumes challenge (prevents challenge-burning DoS).
- * Returns the verified event or sends an error response and returns null.
- */
-function verifyNip98Event(event, res, expectedUrl, expectedMethod) {
-  if (!event || typeof event !== 'object') {
-    jsonResponse(res, 400, { error: 'Missing or invalid "event" field' });
-    return null;
-  }
-  if (event.kind !== 27235) {
-    jsonResponse(res, 400, { error: `Invalid event kind: expected 27235, got ${event.kind}` });
-    return null;
-  }
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - event.created_at) > EVENT_MAX_AGE_S) {
-    jsonResponse(res, 400, { error: 'Event expired or created_at too far from current time' });
-    return null;
-  }
-
-  // Malformed tags must not reach t[0] and throw a 500 out of the handler
-  if (!Array.isArray(event.tags)) {
-    jsonResponse(res, 400, { error: 'Invalid event tags' });
-    return null;
-  }
-  const tags = event.tags.filter((t) => Array.isArray(t));
-
-  // Validate 'u' tag matches expected URL
-  const uTag = tags.find((t) => t[0] === 'u');
-  if (!uTag || uTag[1] !== expectedUrl) {
-    jsonResponse(res, 400, { error: 'Invalid or missing "u" tag in event' });
-    return null;
-  }
-
-  // Validate 'method' tag matches expected HTTP method
-  const methodTag = tags.find((t) => t[0] === 'method');
-  if (!methodTag || methodTag[1] !== expectedMethod) {
-    jsonResponse(res, 400, { error: 'Invalid or missing "method" tag in event' });
-    return null;
-  }
-
-  const challengeTag = tags.find((t) => t[0] === 'challenge');
-  if (!challengeTag || !challengeTag[1]) {
-    jsonResponse(res, 400, { error: 'Missing challenge tag in event' });
-    return null;
-  }
-  const challenge = challengeTag[1];
-  // Check age here rather than relying on the 30s sweeper, which otherwise let
-  // a challenge stay usable for up to ~90s.
-  const issuedAt = challenges.get(challenge);
-  if (issuedAt === undefined || Date.now() - issuedAt > CHALLENGE_TTL_MS) {
-    challenges.delete(challenge);
-    jsonResponse(res, 400, { error: 'Invalid or expired challenge' });
-    return null;
-  }
-
-  // H1: Verify signature BEFORE consuming the challenge
-  let valid;
-  try {
-    valid = verifyEvent(event);
-  } catch (e) {
-    jsonResponse(res, 400, { error: 'Signature verification error' });
-    return null;
-  }
-  if (!valid) {
-    jsonResponse(res, 403, { error: 'Invalid event signature' });
-    return null;
-  }
-
-  // M5: Validate pubkey format
-  if (!PUBKEY_RE.test(event.pubkey)) {
-    jsonResponse(res, 400, { error: 'Invalid pubkey format' });
-    return null;
-  }
-
-  // Only consume challenge after all validation passes
-  challenges.delete(challenge);
-  return event;
 }
 
 /**
@@ -524,7 +431,7 @@ async function createLnbitsWallet(walletName) {
  * Record that a Nostr pubkey owns a wallet.
  *
  * The row in the proxy's own database is the authoritative one: it is written
- * only here, only after verifyNip98Event has checked a signature from this
+ * only here, only after the v2 verifier has checked a signature from this
  * pubkey, and the file is not writable by LNbits or its users. accounts.pubkey
  * is mirrored afterwards purely so LNbits' own UI shows the association; it is
  * never read back for authorization.
@@ -573,57 +480,73 @@ const server = createServer(async (req, res) => {
   try {
     const clientIp = getClientIp(req);
 
-    // CORS preflight — scope to LNURL proxy paths only
-    if (req.method === 'OPTIONS') {
-      const parsedCheck = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-      const isLnurlPath = PROXY_ALLOWLIST.some(re => re.test(parsedCheck.pathname));
-      if (isLnurlPath) {
-        res.writeHead(204, { ...LNURL_CORS_HEADERS, 'Access-Control-Max-Age': '86400' });
-      } else {
-        res.writeHead(204);
+    // Use a configured audience, never Host or forwarded host headers.
+    const parsedUrl = new URL(req.url, BASE_URL);
+    const legacyPaths = ['/api/provision/challenge','/api/provision','/api/claim-username','/api/release-username'];
+    if (legacyPaths.includes(parsedUrl.pathname)) {
+      return jsonResponse(res, 426, {error:'Upgrade required: use the body-bound v2 authentication flow', version:2});
+    }
+    const isAuthPath = AUTH_PATHS.includes(parsedUrl.pathname) || parsedUrl.pathname === CHALLENGE_PATH;
+    let scope;
+    if (isAuthPath) {
+      res.setHeader('Vary', 'Origin');
+      if (req.url !== parsedUrl.pathname) return jsonResponse(res, 400, {error:'Exact path required; queries are not supported'});
+      try { scope = clientScope(req.headers.origin, BROWSER_ORIGINS); }
+      catch { return jsonResponse(res, 403, {error:'Browser origin denied'}); }
+      if (scope !== 'native') res.setHeader('Access-Control-Allow-Origin', scope);
+      if (req.method === 'OPTIONS') {
+        const requested = (req.headers['access-control-request-headers'] || '').toLowerCase().split(',').map(v=>v.trim()).filter(Boolean);
+        const headers = parsedUrl.pathname === CHALLENGE_PATH ? ['content-type'] : ['content-type','authorization','x-nostr-transaction'];
+        if (scope === 'native' || req.headers['access-control-request-method'] !== 'POST' || requested.some(h=>!headers.includes(h))) {
+          return jsonResponse(res,403,{error:'Preflight denied'});
+        }
+        res.setHeader('Vary','Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
+        res.writeHead(204, {'Access-Control-Allow-Methods':'POST','Access-Control-Allow-Headers':headers.join(', ')});
+        return res.end();
       }
+      if (req.method !== 'POST') return jsonResponse(res,405,{error:'POST required'});
+    }
+    if (req.method === 'OPTIONS') {
+      if (PROXY_ALLOWLIST.some(re => re.test(parsedUrl.pathname))) res.writeHead(204, LNURL_CORS_HEADERS);
+      else res.writeHead(204);
       return res.end();
     }
-
-    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    let operationBody, operationRaw;
+    if (isAuthPath) {
+      const bucket = parsedUrl.pathname === CHALLENGE_PATH ? 'challenge' : parsedUrl.pathname === AUTH_PATHS[0] ? 'provision' : parsedUrl.pathname === AUTH_PATHS[1] ? 'claim' : 'release';
+      if (!checkRateLimit(clientIp,bucket)) return jsonResponse(res,429,{error:'Too many requests'});
+      try {
+        operationRaw = await readBody(req);
+        operationBody = JSON.parse(operationRaw.toString('utf8'));
+        if (!operationBody || typeof operationBody !== 'object' || Array.isArray(operationBody)) throw new Error('Invalid JSON object');
+      } catch(e) { return jsonResponse(res,e.message==='BODY_TOO_LARGE'?413:400,{error:'Invalid or oversized JSON body'}); }
+      if (parsedUrl.pathname === CHALLENGE_PATH) {
+        try { return jsonResponse(res,200,auth.issue(operationBody,scope)); }
+        catch(e) { return jsonResponse(res,e.message.startsWith('Server busy')?503:400,{error:e.message}); }
+      }
+      const keys = Object.keys(operationBody).sort().join(',');
+      const expectedKey = parsedUrl.pathname === AUTH_PATHS[0] ? 'name' : parsedUrl.pathname === AUTH_PATHS[1] ? 'username' : '';
+      if (keys !== expectedKey) return jsonResponse(res,400,{error:'Unexpected operation fields'});
+    }
+    const verifyOperation = () => {
+      try { return auth.verify({authorization:req.headers.authorization,token:req.headers['x-nostr-transaction'],raw:operationRaw,url:BASE_URL+req.url,scope}); }
+      catch { jsonResponse(res,403,{error:'Invalid, expired or consumed authentication'}); return null; }
+    };
 
     if (parsedUrl.pathname === '/api/nwc/connections' || parsedUrl.pathname.startsWith('/api/nwc/connections/')) {
       if (!checkRateLimit(clientIp, 'nwc')) return jsonResponse(res, 429, { error: 'Too many requests' });
       if (await nwcRoutes(req, res, parsedUrl)) return;
     }
 
-    // GET /api/provision/challenge
-    if (req.method === 'GET' && parsedUrl.pathname === '/api/provision/challenge') {
-      if (!checkRateLimit(clientIp, 'challenge')) {
-        return jsonResponse(res, 429, { error: 'Too many requests' });
-      }
-      if (challenges.size >= CHALLENGE_MAX) {
-        return jsonResponse(res, 503, { error: 'Server busy, try again later' });
-      }
-      const challenge = randomBytes(32).toString('hex');
-      challenges.set(challenge, Date.now());
-      return jsonResponse(res, 200, { challenge });
-    }
-
-    // POST /api/provision
-    if (req.method === 'POST' && parsedUrl.pathname === '/api/provision') {
-      if (!checkRateLimit(clientIp, 'provision')) {
-        return jsonResponse(res, 429, { error: 'Too many requests' });
-      }
+    // POST /api/v2/provision
+    if (req.method === 'POST' && parsedUrl.pathname === '/api/v2/provision') {
       if (!LNBITS_ADMIN_KEY) {
         return jsonResponse(res, 500, { error: 'Server not configured: missing LNBITS_ADMIN_KEY' });
       }
 
-      let body;
-      try {
-        const raw = await readBody(req);
-        body = JSON.parse(raw);
-      } catch (e) {
-        if (e.message === 'BODY_TOO_LARGE') return jsonResponse(res, 413, { error: 'Request body too large' });
-        return jsonResponse(res, 400, { error: 'Invalid JSON body' });
-      }
+      const body = operationBody;
 
-      const { name, event } = body;
+      const { name } = body;
       if (!name || typeof name !== 'string') {
         return jsonResponse(res, 400, { error: 'Missing or invalid "name" field' });
       }
@@ -633,7 +556,7 @@ const server = createServer(async (req, res) => {
         return jsonResponse(res, 400, { error: 'Invalid wallet name' });
       }
 
-      const verified = verifyNip98Event(event, res, `${BASE_URL}/api/provision`, 'POST');
+      const verified = verifyOperation();
       if (!verified) return;
 
       // C2: Mutex to prevent duplicate wallet provisioning for the same pubkey
@@ -672,22 +595,12 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    // POST /api/claim-username — Claim a Lightning Address
-    if (req.method === 'POST' && parsedUrl.pathname === '/api/claim-username') {
-      if (!checkRateLimit(clientIp, 'claim')) {
-        return jsonResponse(res, 429, { error: 'Too many requests' });
-      }
+    // POST /api/v2/claim-username — Claim a Lightning Address
+    if (req.method === 'POST' && parsedUrl.pathname === '/api/v2/claim-username') {
 
-      let body;
-      try {
-        const raw = await readBody(req);
-        body = JSON.parse(raw);
-      } catch (e) {
-        if (e.message === 'BODY_TOO_LARGE') return jsonResponse(res, 413, { error: 'Request body too large' });
-        return jsonResponse(res, 400, { error: 'Invalid JSON body' });
-      }
+      const body = operationBody;
 
-      const { event, username } = body;
+      const { username } = body;
       if (!username || typeof username !== 'string') {
         return jsonResponse(res, 400, { error: 'Missing or invalid "username" field' });
       }
@@ -700,7 +613,7 @@ const server = createServer(async (req, res) => {
         return jsonResponse(res, 400, { error: 'This username is reserved' });
       }
 
-      const verified = verifyNip98Event(event, res, `${BASE_URL}/api/claim-username`, 'POST');
+      const verified = verifyOperation();
       if (!verified) return;
 
       // Look up user's wallet
@@ -798,22 +711,12 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    // POST /api/release-username
-    if (req.method === 'POST' && parsedUrl.pathname === '/api/release-username') {
-      if (!checkRateLimit(clientIp, 'release')) {
-        return jsonResponse(res, 429, { error: 'Too many requests' });
-      }
+    // POST /api/v2/release-username
+    if (req.method === 'POST' && parsedUrl.pathname === '/api/v2/release-username') {
 
-      let body;
-      try {
-        const raw = await readBody(req);
-        body = JSON.parse(raw);
-      } catch (e) {
-        if (e.message === 'BODY_TOO_LARGE') return jsonResponse(res, 413, { error: 'Request body too large' });
-        return jsonResponse(res, 400, { error: 'Invalid JSON body' });
-      }
+      const body = operationBody;
 
-      const verified = verifyNip98Event(body.event, res, `${BASE_URL}/api/release-username`, 'POST');
+      const verified = verifyOperation();
       if (!verified) return;
 
       const wallet = findWalletByPubkey(verified.pubkey);

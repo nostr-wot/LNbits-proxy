@@ -54,6 +54,20 @@ tail -50 /home/phoenixd/.phoenix/phoenix.log | grep -iE 'ECONNRESET|CLOSED|ESTAB
 systemctl restart phoenixd
 ```
 
+### Provisioning returns 426 or authentication fails after upgrade
+
+426 means the client still calls the retired v1 routes. Upgrade the client to the v2
+body-bound transaction flow; do not restore an unsigned-body fallback. Deploy only after
+compatible clients are ready. Check `PUBLIC_ORIGIN` exactly matches the externally served
+HTTPS origin. Query strings on v2 paths are rejected. Browser callers additionally need
+an exact `BROWSER_ORIGINS` entry and a matching signed `client-origin` tag.
+
+Check the client clock, exact serialized body hash and transaction header for 403s.
+Do not log Authorization or X-Nostr-Transaction values. A challenge is consumed once,
+including when a later wallet operation fails; retries need a fresh challenge and signature.
+All proxy processes must use the same `PROVISION_DB_PATH`; its `auth_challenges_v2` table
+is the persistent nonce store. A process restart does not clear valid challenges.
+
 ### Provisioning returns 503, "could not be linked"
 
 A wallet was created in LNbits but could not be mapped to its Nostr pubkey, so its keys
@@ -125,4 +139,9 @@ cd /srv/LNbits-proxy && ./deploy.sh --ref <previous-commit>
 ```
 
 Or restore the dated backups the last deploy left beside the live files and restart the
-proxy process. Never restart LNbits or phoenixd for a proxy-only change.
+proxy process. Restore `monitor.mjs` from the **same backup stamp** along with the proxy
+modules: the v2 monitor calls a POST challenge endpoint that the legacy proxy does not
+serve. Restoring only the old server leaves the new monitor reporting false failures.
+The failed-deploy rollback commands printed by `deploy.sh` include the monitor restore.
+Cron loads the restored monitor on its next run; it needs no service restart. Never
+restart LNbits or phoenixd for a proxy-only change.

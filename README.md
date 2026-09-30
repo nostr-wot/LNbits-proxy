@@ -14,16 +14,16 @@ Self-hosting guide, written for operators running their own instance:
 
 | Endpoint | Method | Auth | Purpose |
 |---|---|---|---|
-| `/api/provision/challenge` | GET | none | Issue a single-use challenge |
-| `/api/provision` | POST | NIP-98 | Create or recover a wallet for a pubkey |
+| `/api/v2/provision/challenge` | POST | none | Issue a single-use challenge |
+| `/api/v2/provision` | POST | NIP-98 | Create or recover a wallet for a pubkey |
 
 ### Lightning Address
 
 | Endpoint | Method | Auth | Purpose |
 |---|---|---|---|
-| `/api/claim-username` | POST | NIP-98 | Claim a username |
+| `/api/v2/claim-username` | POST | NIP-98 | Claim a username |
 | `/api/lightning-address?pubkey=<64 hex>` | GET | none | Look up the address for a pubkey |
-| `/api/release-username` | POST | NIP-98 | Release a claimed username |
+| `/api/v2/release-username` | POST | NIP-98 | Release a claimed username |
 
 ### NWC app connections
 
@@ -63,20 +63,54 @@ query string is rejected so keys stay out of access logs.
 
 ## Authentication
 
-Provisioning and every Lightning Address mutation use NIP-98 challenge-response.
+Provisioning and every Lightning Address mutation require the v2 transaction flow.
+Legacy `/api/provision/challenge`, `/api/provision`, `/api/claim-username` and
+`/api/release-username` return **426 Upgrade Required**. There is no legacy fallback.
+Coordinate the client upgrade before deploying this change.
 
-1. `GET /api/provision/challenge` returns `{ "challenge": "<hex>" }`
-2. Build a kind `27235` event with **three mandatory tags**, all matched exactly:
-   - `u` — the full absolute URL being called, e.g. `https://<your-domain>/api/provision`
-   - `method` — the HTTP method, `POST`
-   - `challenge` — the challenge from step 1
-3. Send it as the `event` field of the POST body
-4. The Schnorr signature is verified before the challenge is consumed, so a failed
-   attempt does not burn it
+1. Serialize the operation body once: `{ "name": "..." }` for provisioning,
+   `{ "username": "..." }` for claiming, or `{}` for releasing. Hash the exact UTF-8
+   bytes with SHA-256. Extra operation fields are rejected.
+2. POST `/api/v2/provision/challenge` with `{ "url": "https://<public-origin>/api/v2/provision",
+   "method": "POST", "payload": "<lowercase hex SHA-256>" }` (use the exact target
+   mutation URL). Response: `{ "version": 2, "challenge": "<64 hex>",
+   "transactionToken": "<64 hex>", "expiresAt": <Unix seconds> }`.
+3. Sign kind `27235`, empty content, current integer `created_at`, and exactly one
+   two-string tag each: `u` (exact operation URL), `method` (`POST`), `payload`
+   (exact body hash), `challenge`, and `transaction` (SHA-256 of the transaction
+   token's UTF-8 string, **not** its decoded hex bytes).
+4. POST the original serialized operation bytes to the v2 target. Send the signed
+   event as base64-encoded JSON in `Authorization: Nostr <base64>` and the separate
+   token in `X-Nostr-Transaction`. Do not include the event in the operation body.
 
-Two independent windows apply: the challenge expires 60 seconds after issue, and the
-event's `created_at` must be within 60 seconds of server time. A client with a skewed
-clock fails even with a fresh challenge.
+Challenges expire after 60 seconds; event timestamps must be within 60 seconds.
+The proxy stores challenges in `PROVISION_DB_PATH`, binds their URL, method, payload,
+transaction hash and client scope, and consumes them with a single conditional SQLite
+DELETE after signature and body validation. This prevents replay across processes sharing
+that database. Invalid signatures, changed bodies and mismatched bindings do not burn
+challenges. Issuance prunes expired entries and caps outstanding rows at 10,000.
+All instances must share the same protected database; independent databases are not a
+shared nonce store. Do not place SQLite on unsupported network filesystems.
+
+Fixed v2 paths reject query strings and noncanonical request targets. The audience comes
+from `PUBLIC_ORIGIN`, never client-controlled Host or forwarded-host headers.
+
+### Browser client policy
+
+`BROWSER_ORIGINS` is a comma-separated exact HTTPS origin allowlist, empty by default.
+A browser Origin outside it (including `null`) is rejected before challenge issuance.
+Allowed browser clients must add exactly one `client-origin` tag matching their request
+Origin; the challenge is bound to this same value. CORS echoes that origin, varies on
+Origin, and permits only POST plus Content-Type, Authorization and X-Nostr-Transaction
+(the challenge endpoint permits only Content-Type). No cookies are used.
+
+Missing Origin and native extension scheme origins use the separate native flow, requiring
+both the signed event and transaction token and no `client-origin` tag. These values are
+not browser or extension attestation: nonbrowser clients can forge Origin, and a holder
+of a fresh valid event **and** its transaction token can win first use at the intended
+backend. Exact audience/body binding prevents changing or redirecting that authority;
+CORS and single-use state cannot eliminate first-use forwarding. Public LNURL endpoints
+retain their separate permissive CORS policy. Wallet-key API authentication is unchanged.
 
 ## Rate limits
 
@@ -87,9 +121,9 @@ Per client address per minute; over the limit returns 429.
 | `/api/nwc/connections` | 60 |
 | `/api/v1/wallet`, `/api/v1/payments` | 120 |
 | LNURL passthrough | 60 |
-| `/api/provision/challenge` | 10 |
-| `/api/provision` | 5 |
-| `/api/claim-username`, `/api/release-username` | 3 |
+| `/api/v2/provision/challenge` | 10 |
+| `/api/v2/provision` | 5 |
+| `/api/v2/claim-username`, `/api/v2/release-username` | 3 |
 
 The client address is the rightmost `X-Forwarded-For` entry, appended by your reverse
 proxy. **If a CDN sits in front, configure it to restore the real client IP**
@@ -107,6 +141,8 @@ Copy `.env.example`. Only `LNBITS_ADMIN_KEY` is required.
 | `LNBITS_DB_PATH` | `/home/lnbits/lnbits/data/database.sqlite3` | LNbits database |
 | `LNURLP_DB_PATH` | `/home/lnbits/lnbits/data/ext_lnurlp.sqlite3` | lnurlp extension database |
 | `PROVISION_DB_PATH` | `/srv/zaps-provision/provisioning.sqlite3` | Proxy-owned pubkey to wallet mapping |
+| `PUBLIC_ORIGIN` | `https://zaps.nostr-wot.com` | Exact HTTPS audience origin, no trailing slash |
+| `BROWSER_ORIGINS` | *(empty)* | Comma-separated exact HTTPS browser origins |
 | `PORT` | `3003` | Loopback listen port |
 
 The service binds `127.0.0.1` only, and refuses to start if a database path does not
@@ -134,10 +170,6 @@ node scripts/backfill-provisioned.mjs
 It is idempotent and verifies that every pubkey resolves to the same wallet and keys as
 before, exiting non-zero otherwise. `deploy.sh` runs it before restarting and aborts the
 deploy if verification fails.
-
-> **The public domain is a constant in `server.js`, not an environment variable.** NIP-98
-> rejects any event whose `u` tag does not match it exactly, so an unmodified copy refuses
-> every provisioning request on another domain. Edit `DOMAIN` before deploying.
 
 ## Running
 
