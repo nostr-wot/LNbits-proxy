@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased — Authentication v2
+## Authentication v2
 
-Implementation merged September 30, 2026; production rollout is pending.
+Companion backend changes for the coordinated Nostr WoT Extension 0.8.7 release.
 
 - Add versioned provisioning, address-claim and address-release authentication with signatures in the Authorization header and a SHA-256 commitment to the exact operation body bytes.
 - Bind each 60-second challenge to its URL, method, payload, client scope and a separate transaction-token hash. Consume valid challenges atomically in SQLite to reject replay across processes sharing the database.

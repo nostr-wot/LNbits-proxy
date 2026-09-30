@@ -10,9 +10,8 @@ Self-hosting guide, written for operators running their own instance:
 
 ## Authentication changes and migration
 
-The v2 authentication implementation is merged in this repository. As of September
-30, 2026, its production deployment and the companion extension 0.8.7 publication
-are pending; do not infer live service behavior from the source version alone.
+Authentication v2 is the companion backend protocol for Nostr WoT Extension 0.8.7.
+The backend and extension changes form one coordinated release.
 
 Read the community guide on
 [backend authentication protections](https://github.com/nostr-wot/nostr-wot-extension/blob/main/docs/guides/backend-authentication.md)
