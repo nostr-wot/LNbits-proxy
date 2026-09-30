@@ -8,6 +8,25 @@ and everything else returns 404.
 Self-hosting guide, written for operators running their own instance:
 <https://nostr-wot.com/docs/lnbits-proxy>
 
+## Authentication changes and migration
+
+The v2 authentication implementation is merged in this repository. As of September
+30, 2026, its production deployment and the companion extension 0.8.7 publication
+are pending; do not infer live service behavior from the source version alone.
+
+Read the community guide on
+[backend authentication protections](https://github.com/nostr-wot/nostr-wot-extension/blob/main/docs/guides/backend-authentication.md)
+for the website/API trust boundaries and limitations. The separate
+[relay authentication guide](https://github.com/nostr-wot/nostr-wot-extension/blob/main/docs/guides/relay-authentication.md)
+explains the extension's NIP-42 permissions; this HTTP proxy does not implement
+relay connection authentication.
+
+See [CHANGELOG.md](CHANGELOG.md) for the backend changes, the
+[wire contract](https://github.com/nostr-wot/nostr-wot-extension/blob/main/docs/wallet-auth-v2.md)
+for client integration, and [RUNBOOK.md](RUNBOOK.md) for deployment and rollback.
+Stage compatible clients, deploy and verify this backend, then publish the
+extension. Legacy authentication routes return 426 after this backend is deployed.
+
 ## Endpoints
 
 ### Wallet provisioning
@@ -66,7 +85,7 @@ query string is rejected so keys stay out of access logs.
 Provisioning and every Lightning Address mutation require the v2 transaction flow.
 Legacy `/api/provision/challenge`, `/api/provision`, `/api/claim-username` and
 `/api/release-username` return **426 Upgrade Required**. There is no legacy fallback.
-Coordinate the client upgrade before deploying this change.
+Stage compatible clients before deployment, then deploy and verify the backend before publishing the extension.
 
 1. Serialize the operation body once: `{ "name": "..." }` for provisioning,
    `{ "username": "..." }` for claiming, or `{}` for releasing. Hash the exact UTF-8
