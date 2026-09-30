@@ -1,5 +1,18 @@
 # Changelog
 
+## Wallet fee quotes
+
+- Allow `GET /api/v1/payments/fee-reserve` through the wallet API proxy, so a client
+  can read the `fee_limit_msat` ceiling LNbits would apply before sending a payment.
+  Wallets that refuse to move a balance on an unknown fee can now quote one.
+- Give each wallet API allowlist entry its own permitted verbs. The new path is GET
+  only and exactly anchored: `POST` to it, `/api/v1/payments/{hash}`, and every other
+  neighbouring path stay 404. `/api/v1/wallet` and `/api/v1/payments` are unchanged,
+  including their `POST` support and the shared 120/min limit.
+- Keys must still arrive in `X-Api-Key`; a key in the query string is still rejected.
+
+Purely additive to the proxy surface. No existing client needs to change.
+
 ## Authentication v2
 
 Companion backend changes for the coordinated Nostr WoT Extension 0.8.7 release.

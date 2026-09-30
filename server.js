@@ -22,6 +22,7 @@
  * Proxied wallet API paths (requires X-Api-Key, used by extension):
  *   GET/POST /api/v1/wallet
  *   GET/POST /api/v1/payments
+ *   GET      /api/v1/payments/fee-reserve
  *
  * Environment variables:
  *   LNBITS_URL       - LNbits backend URL (default: http://127.0.0.1:5000)
@@ -123,10 +124,17 @@ const PROXY_ALLOWLIST = [
   /^\/lnurlp\/api\/v1\/lnurl\/cb\/[a-zA-Z0-9]+$/,
 ];
 
-// Wallet API paths that require X-Api-Key authentication (used by extension)
+// Wallet API paths that require X-Api-Key authentication (used by extension).
+// Matched against the normalized pathname only; `methods` is exhaustive, so a
+// path is reachable by the verbs listed for it and by nothing else.
 const WALLET_API_ALLOWLIST = [
-  /^\/api\/v1\/wallet$/,
-  /^\/api\/v1\/payments$/,
+  { methods: ['GET', 'POST'], pathname: /^\/api\/v1\/wallet$/ },
+  { methods: ['GET', 'POST'], pathname: /^\/api\/v1\/payments$/ },
+  // GET /api/v1/payments/fee-reserve?invoice=<bolt11> returns the fee_limit_msat
+  // LNbits hands the funding source, so the extension can compare a sweep's
+  // ceiling against the balance instead of refusing to sweep on an unknown fee.
+  // Read-only, and anchored so it cannot widen into /api/v1/payments/<hash>.
+  { methods: ['GET'], pathname: /^\/api\/v1\/payments\/fee-reserve$/ },
 ];
 
 // ── Per-IP rate limiting ──
@@ -781,9 +789,9 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // Wallet API proxy (requires X-Api-Key, supports GET/POST)
-    if ((req.method === 'GET' || req.method === 'POST') &&
-        WALLET_API_ALLOWLIST.some(re => re.test(parsedUrl.pathname))) {
+    // Wallet API proxy (requires X-Api-Key, each path limited to its own verbs)
+    const walletRoute = WALLET_API_ALLOWLIST.find(e => e.pathname.test(parsedUrl.pathname));
+    if (walletRoute && walletRoute.methods.includes(req.method)) {
       if (!checkRateLimit(clientIp, 'wallet')) {
         return jsonResponse(res, 429, { error: 'Too many requests' });
       }

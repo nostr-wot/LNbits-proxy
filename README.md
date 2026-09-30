@@ -73,11 +73,17 @@ GET       /.well-known/lnurlp/{username}      public, permissive CORS
 GET       /lnurlp/api/v1/lnurl/cb/{id}        public, permissive CORS
 GET|POST  /api/v1/wallet                      requires X-Api-Key
 GET|POST  /api/v1/payments                    requires X-Api-Key
+GET       /api/v1/payments/fee-reserve        requires X-Api-Key, GET only
 ```
 
 `Host` is rewritten to the public domain on the LNURL paths so LNbits builds correct
 callback URLs. Wallet keys must be sent in the `X-Api-Key` header; `?api-key=` in the
 query string is rejected so keys stay out of access logs.
+
+`/api/v1/payments/fee-reserve?invoice=<bolt11>` returns `{"fee_reserve": <msat>}`, the
+`fee_limit_msat` LNbits hands its funding source, so a client can bound what a payment
+may cost before sending it. GET only, and not a payment lookup: `/api/v1/payments/{hash}`
+stays unreachable.
 
 ## Authentication
 
@@ -137,7 +143,7 @@ Per client address per minute; over the limit returns 429.
 | Route | Limit |
 |---|---|
 | `/api/nwc/connections` | 60 |
-| `/api/v1/wallet`, `/api/v1/payments` | 120 |
+| `/api/v1/wallet`, `/api/v1/payments`, `/api/v1/payments/fee-reserve` | 120 |
 | LNURL passthrough | 60 |
 | `/api/v2/provision/challenge` | 10 |
 | `/api/v2/provision` | 5 |
