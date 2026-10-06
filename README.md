@@ -43,6 +43,41 @@ extension. Legacy authentication routes return 426 after this backend is deploye
 | `/api/lightning-address?pubkey=<64 hex>` | GET | none | Look up the address for a pubkey |
 | `/api/v2/release-username` | POST | NIP-98 | Release a claimed username |
 
+### Account deletion
+
+| Endpoint | Method | Auth | Purpose |
+|---|---|---|---|
+| `/api/v2/delete-account` | POST | NIP-98 | Delete the signer's hosted wallet account |
+
+Body: `{"confirm":"delete-account","acknowledgeBalance":<boolean>}`, signed with the
+same v2 transaction flow as the routes above. The body names no account: the signed
+event's pubkey is the only identity used, so a signer can only ever reach their own.
+
+| Status | Body | Meaning |
+|---|---|---|
+| 200 | `{"deleted":true}` | Everything below is gone |
+| 400 | `{"error":"invalid_request"}` | `confirm` is not `"delete-account"`, or `acknowledgeBalance` is not a boolean |
+| 403 | `{"error":"..."}` | Missing, invalid, expired or consumed authentication, as for every v2 route |
+| 404 | `{"error":"not_found"}` | No account for this pubkey, including after a completed deletion |
+| 409 | `{"error":"balance_not_zero","balanceMsat":<n>}` | Balance above zero and `acknowledgeBalance` is not `true`; nothing deleted |
+| 409 | `{"error":"payment_pending"}` | An outgoing payment is still in flight; retry once it settles or fails |
+| 409 | `{"error":"in_progress"}` | Another provision or deletion for this pubkey is running |
+| 409 | `{"error":"shared_account"}` | The mapping reaches another pubkey's LNbits records; refused, operator must repair |
+| 502 | `{"error":"upstream_unavailable"}` | LNbits or the NWC provider failed; safe to retry with a fresh challenge |
+| 500 | `{"error":"deletion_failed"}` | A database step failed; safe to retry with a fresh challenge |
+
+A deletion revokes every NWC grant the wallet holds (expired ones included),
+releases the Lightning Address, deletes the LNbits wallet, its account and the rows
+LNbits keys by them, then removes the proxy's pubkey mapping. With
+`acknowledgeBalance: true` any remaining balance is forfeited and stays with the
+operator's node. The balance is checked again after the address is released, so a zap
+that lands mid-deletion is counted. Each step is idempotent and the mapping is
+removed last, so a call that fails part-way is completed by the next one. Clients
+should treat 404 after a 200, or after a failed attempt they retried, as "already
+deleted". The proxy keeps only an anonymous record: a timestamp and the forfeited
+msat, with no pubkey, user or wallet id. See [RUNBOOK.md](RUNBOOK.md#account-deletion)
+for what LNbits retains.
+
 ### NWC app connections
 
 | Endpoint | Method | Auth | Purpose |
@@ -87,13 +122,15 @@ stays unreachable.
 
 ## Authentication
 
-Provisioning and every Lightning Address mutation require the v2 transaction flow.
+Provisioning, account deletion and every Lightning Address mutation require the v2
+transaction flow.
 Legacy `/api/provision/challenge`, `/api/provision`, `/api/claim-username` and
 `/api/release-username` return **426 Upgrade Required**. There is no legacy fallback.
 Stage compatible clients before deployment, then deploy and verify the backend before publishing the extension.
 
 1. Serialize the operation body once: `{ "name": "..." }` for provisioning,
-   `{ "username": "..." }` for claiming, or `{}` for releasing. Hash the exact UTF-8
+   `{ "username": "..." }` for claiming, `{}` for releasing, or
+   `{ "confirm": "delete-account", "acknowledgeBalance": <boolean> }` for deleting. Hash the exact UTF-8
    bytes with SHA-256. Extra operation fields are rejected.
 2. POST `/api/v2/provision/challenge` with `{ "url": "https://<public-origin>/api/v2/provision",
    "method": "POST", "payload": "<lowercase hex SHA-256>" }` (use the exact target
@@ -148,6 +185,7 @@ Per client address per minute; over the limit returns 429.
 | `/api/v2/provision/challenge` | 10 |
 | `/api/v2/provision` | 5 |
 | `/api/v2/claim-username`, `/api/v2/release-username` | 3 |
+| `/api/v2/delete-account` | 3 |
 
 The client address is the rightmost `X-Forwarded-For` entry, appended by your reverse
 proxy. **If a CDN sits in front, configure it to restore the real client IP**

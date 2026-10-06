@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { verifyEvent } from 'nostr-tools/pure';
 
 const HEX = /^[0-9a-f]{64}$/;
-export const AUTH_PATHS = ['/api/v2/provision','/api/v2/claim-username','/api/v2/release-username'];
+export const AUTH_PATHS = ['/api/v2/provision','/api/v2/claim-username','/api/v2/release-username','/api/v2/delete-account'];
 export const CHALLENGE_PATH = '/api/v2/provision/challenge';
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
 function requireValid(condition, message = 'Invalid authentication') {

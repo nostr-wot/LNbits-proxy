@@ -132,6 +132,88 @@ tail -20 /srv/zaps-monitor/cron.log
 Check `zaps-monitor.env` is readable and mode 600. Alerting needs two consecutive
 failures by default.
 
+## Account deletion
+
+`POST /api/v2/delete-account` is the in-app "delete my account" path (App Store
+guideline 5.1.1(v)). The README has the wire contract. What it does, in order:
+
+1. Refuses with 409 if the account has a balance the user did not acknowledge, or an
+   outgoing payment still pending. Nothing is touched.
+2. Revokes every NWC grant through the provider's API with the wallet's own admin
+   key, expired grants included, then lists again and fails if any remain. If the
+   user had switched the provider off, it is switched back on for that account first
+   so the revocation is accepted.
+3. Deletes the Lightning Address pay link from the lnurlp database.
+4. Reads the balance again, so a zap that landed in between is counted.
+5. In one transaction on the LNbits database, deletes the account's rows in
+   `balance_check`, `balance_notify`, `tiny_url`, `wasm_invocations`, `extensions`,
+   `webpush_subscriptions`, `assets`, `audit`, then `wallets` and `accounts`. Tables a
+   given LNbits version lacks are skipped.
+6. In one transaction on `PROVISION_DB_PATH`, deletes the `provisioned` row and adds
+   one row to `account_deletions` (timestamp and forfeited msat only).
+
+A failure at any step returns 502 or 500 and leaves the earlier steps done; the next
+call repeats the finished ones harmlessly and completes the rest.
+
+**Why direct database writes and not the LNbits API.** LNbits' user-management API
+(`DELETE /users/api/v1/user/{id}` and `.../wallet/{id}`) only accepts an admin
+*account* session or access token, not the wallet key this proxy holds as
+`LNBITS_ADMIN_KEY`. The proxy already writes LNbits' `accounts`, `extensions` and
+`pay_links` tables directly, so deletion reverses provisioning the same way. The rows
+are hard-deleted, which is stronger than LNbits' own admin delete (that one only
+flags wallets `deleted` and keeps their rows).
+
+**Limitations to know about:**
+
+- **LNbits' authentication cache.** LNbits caches wallet-key lookups for
+  `AUTH_AUTHENTICATION_CACHE_MINUTES` (default 10). The proxy cannot clear that cache
+  from outside, so for up to that long LNbits may still accept the deleted wallet's
+  keys on cached-key endpoints, such as listing payments via `GET /api/v1/payments`.
+  Creating an invoice or paying one still fails, because both reload the wallet
+  first. The keys exist only on the user's own device, which has just deleted them.
+  Restarting LNbits clears the cache, but do not restart it just for this.
+- **The payment ledger is retained.** `apipayments` rows stay, keyed by the deleted
+  wallet id, so node balance and LNbits liabilities still reconcile. Nothing links
+  them to the pubkey any more: the account row (`accounts.pubkey`, `username`) and
+  the mapping are gone. Payment `extra` fields can still carry NIP-57 zap requests,
+  which name the payer and recipient. Purge those by hand if a request requires it.
+- **Invoices issued before deletion.** An unpaid invoice still in its expiry window
+  can settle after the wallet is gone. LNbits then records it against a wallet id that
+  no longer exists, and the sats stay on the node. Find them with:
+
+  ```bash
+  sqlite3 /home/lnbits/lnbits/data/database.sqlite3 \
+    "SELECT checking_id, amount, status FROM apipayments
+     WHERE wallet_id NOT IN (SELECT id FROM wallets) AND status = 'success' AND amount > 0"
+  ```
+- **NWC provider disabled for the whole instance.** If `nwcprovider` is not installed
+  and active, its API cannot be called and grants are not revoked. They stay in the
+  provider's own database pointing at a wallet that no longer exists, so they cannot
+  spend. Remove them with the provider's tools if it is re-enabled.
+- **Shared wallets.** If another LNbits user had a shared wallet pointing at this one,
+  their share stops working. The proxy never creates shares.
+- **Logs.** The proxy's own log lines carry 16-character pubkey prefixes and wallet
+  ids from earlier provisioning and claims. They age out under whatever pm2 log
+  rotation the host runs; deletion does not rewrite them.
+
+**Verifying a deletion.** The operator does not learn which account was deleted, by
+design. Check the anonymous record and the log line:
+
+```bash
+sqlite3 /srv/zaps-provision/provisioning.sqlite3 \
+  "SELECT id, datetime(deleted_at,'unixepoch'), forfeited_msat FROM account_deletions ORDER BY id DESC LIMIT 5"
+pm2 logs zaps-provision --lines 500 --nostream | grep '\[delete-account\]'
+```
+
+If a user reports a specific pubkey, `SELECT 1 FROM provisioned WHERE pubkey='<hex>'`
+must return nothing, and `curl -s 'https://<your-domain>/api/lightning-address?pubkey=<hex>'`
+must return `{"address":null}`. A nonzero `forfeited_msat` is balance the user chose
+to give up; it stays on the node.
+
+A 409 `shared_account` means the mapping points at an LNbits account or wallet another
+pubkey also maps to. That should never happen; check `provisioned` for duplicate
+`user_id` or `wallet_id` values before the user retries.
+
 ## Rolling back
 
 ```bash

@@ -169,6 +169,7 @@ check "legacy challenge retired" 426 "$BASE_URL/api/provision/challenge"
 check "public health"         200 "$BASE_URL/healthz"
 check "wallet auth (no key)" 401 "$BASE_URL/api/v1/wallet"
 check "nwc (no key)"         401 "$BASE_URL/api/nwc/connections"
+check "delete-account is POST" 405 "$BASE_URL/api/v2/delete-account"
 check "unknown path"         404 "$BASE_URL/api/nope"
 
 if [ -f scripts/backfill-provisioned.mjs ]; then

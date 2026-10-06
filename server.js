@@ -14,6 +14,7 @@
  *   POST /api/v2/claim-username       - Claim a Lightning Address username
  *   GET  /api/lightning-address    - Look up Lightning Address by pubkey
  *   POST /api/v2/release-username     - Release a claimed Lightning Address
+ *   POST /api/v2/delete-account       - Delete the signer's hosted wallet account
  *
  * Proxied LNURL paths (GET-only, needed for LNURL callbacks):
  *   GET /.well-known/lnurlp/:username
@@ -96,13 +97,31 @@ function openProvisionDb() {
         user_id    TEXT NOT NULL,
         wallet_id  TEXT NOT NULL,
         created_at REAL NOT NULL
-      )
+      );
+      -- One row per completed account deletion. Deliberately carries no pubkey,
+      -- user or wallet id: only when it happened and what balance was forfeited.
+      CREATE TABLE IF NOT EXISTS account_deletions (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        deleted_at     INTEGER NOT NULL,
+        forfeited_msat INTEGER NOT NULL DEFAULT 0
+      );
     `);
   } catch (e) {
     db.close();
     throw e;
   }
   return db;
+}
+
+// Each v2 operation: its rate-limit bucket and the exact, sorted set of body fields.
+const AUTH_ROUTES = {
+  '/api/v2/provision':        { bucket: 'provision',     fields: 'name' },
+  '/api/v2/claim-username':   { bucket: 'claim',         fields: 'username' },
+  '/api/v2/release-username': { bucket: 'release',       fields: '' },
+  '/api/v2/delete-account':   { bucket: 'deleteAccount', fields: 'acknowledgeBalance,confirm' },
+};
+for (const path of AUTH_PATHS) {
+  if (!AUTH_ROUTES[path]) throw new Error(`No route configuration for ${path}`);
 }
 
 const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{1,28}[a-z0-9]$/;
@@ -145,6 +164,7 @@ const rateLimitBuckets = {
   provision:  { maxPerMin: 5,  entries: new Map() },
   claim:      { maxPerMin: 3,  entries: new Map() },
   release:    { maxPerMin: 3,  entries: new Map() },
+  deleteAccount: { maxPerMin: 3, entries: new Map() },
   // Unauthenticated LNURL callbacks create a real invoice in LNbits and the
   // Lightning backend on every hit. A real wallet calls once per zap, so this
   // is generous while still bounding invoice-flooding from a single host.
@@ -180,8 +200,10 @@ const _rlCleanup = setInterval(() => {
 }, 300_000);
 _rlCleanup.unref();
 
-// In-memory mutex sets to prevent race conditions on provisioning/claiming
-const _provisioningPubkeys = new Set();
+// In-memory mutex sets to prevent race conditions on provisioning/claiming.
+// Provisioning and account deletion share one set, so a pubkey can never be
+// provisioned while its account is being deleted, or deleted twice at once.
+const _busyPubkeys = new Set();
 const _claimingUsernames = new Set();
 
 // ── Helpers ──
@@ -482,6 +504,250 @@ function linkWalletToPubkey(userId, walletId, pubkey) {
   }
 }
 
+// ── Account deletion ──
+//
+// Deletes everything this proxy and LNbits hold for one pubkey's hosted account.
+// The steps are ordered so a failure part-way leaves a state the next call
+// finishes, and so that nothing is deleted while it could still strand funds:
+//
+//   1. refuse if the account holds a balance the caller did not acknowledge, or
+//      has an outgoing payment in flight (a failed one would refund a wallet
+//      that no longer exists)
+//   2. revoke every NWC grant, through the provider's API, while the wallet
+//      keys still work
+//   3. release the Lightning Address, so no new zap can land
+//   4. check the balance again, now that nothing can pay in
+//   5. delete the LNbits records in one transaction
+//   6. delete the mapping and write the anonymous audit row in one transaction
+//
+// The mapping goes last: while it exists a retry can find the account, and once
+// it is gone the account is unreachable by design. No log line here carries the
+// pubkey, the LNbits user id or the wallet id.
+
+const DELETE_CONFIRMATION = 'delete-account';
+
+// LNbits rows tied to the account, purged after the wallets' own dependants and
+// before the wallets and the account itself. Tables or columns this LNbits
+// version does not have are skipped. The apipayments ledger is deliberately not
+// in this list: see RUNBOOK.md.
+const LNBITS_ACCOUNT_ROWS = [
+  ['balance_check', 'wallet', 'wallet'],
+  ['balance_notify', 'wallet', 'wallet'],
+  ['tiny_url', 'wallet', 'wallet'],
+  ['wasm_invocations', 'wallet_id', 'wallet'],
+  ['wasm_invocations', 'user_id', 'user'],
+  ['extensions', 'user', 'user'],
+  ['webpush_subscriptions', 'user', 'user'],
+  ['assets', 'user_id', 'user'],
+  ['audit', 'user_id', 'user'],
+  ['wallets', 'user', 'user'],
+  ['accounts', 'id', 'user'],
+];
+
+class DeletionError extends Error {
+  constructor(step, message, { upstream = false } = {}) {
+    super(message);
+    this.step = step;
+    this.upstream = upstream;
+  }
+}
+
+function tableColumns(db, table) {
+  return new Set(db.prepare(`PRAGMA table_info(${JSON.stringify(table)})`).all().map(c => c.name));
+}
+
+const placeholders = (values) => values.map(() => '?').join(',');
+
+/** The apipayments filters for this LNbits schema (status column since 1.0, pending flag before). */
+function paymentStateSql(db) {
+  const columns = tableColumns(db, 'apipayments');
+  if (columns.has('status')) {
+    return {
+      pendingOut: `status = 'pending' AND amount < 0`,
+      counted: `(status = 'success' AND amount > 0) OR (status IN ('success', 'pending') AND amount < 0)`,
+    };
+  }
+  if (columns.has('pending')) {
+    return { pendingOut: `pending = 1 AND amount < 0`, counted: `(pending = 0 AND amount > 0) OR amount < 0` };
+  }
+  // Fail closed: without a ledger we cannot tell whether deleting strands funds.
+  throw new Error('apipayments ledger not readable');
+}
+
+/** Balance of one wallet, in msat, as LNbits itself reports it to the wallet's own key. */
+async function readWalletBalance(adminKey) {
+  let res;
+  try {
+    res = await fetch(`${LNBITS_URL}/api/v1/wallet`, {
+      redirect: 'error',
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      headers: { 'X-Api-Key': adminKey },
+    });
+  } catch (e) {
+    throw new DeletionError('balance', `LNbits unreachable: ${e.message}`, { upstream: true });
+  }
+  if (!res.ok) throw new DeletionError('balance', `LNbits wallet read HTTP ${res.status}`, { upstream: true });
+  let body;
+  try { body = await res.json(); } catch { body = null; }
+  if (!Number.isFinite(body?.balance)) throw new DeletionError('balance', 'LNbits wallet read returned no balance', { upstream: true });
+  return Math.trunc(body.balance);
+}
+
+/**
+ * Funds still attached to the account: the balance of every wallet the LNbits
+ * user owns, and whether any outgoing payment is still in flight. Live wallets
+ * are read through LNbits' API; a wallet LNbits already soft-deleted has no
+ * working key, so its balance is summed from the ledger with LNbits' own rule.
+ */
+async function assessAccountFunds(userId) {
+  let wallets, softDeletedMsat = 0, pendingOut = 0;
+  const db = openDb(LNBITS_DB_PATH, { readOnly: true });
+  try {
+    wallets = db.prepare('SELECT id, adminkey, deleted FROM wallets WHERE "user" = ?').all(userId);
+    if (wallets.length) {
+      const ids = wallets.map(w => w.id);
+      const sql = paymentStateSql(db);
+      pendingOut = db.prepare(
+        `SELECT COUNT(*) AS n FROM apipayments WHERE wallet_id IN (${placeholders(ids)}) AND ${sql.pendingOut}`
+      ).get(...ids).n;
+      const deletedIds = wallets.filter(w => w.deleted).map(w => w.id);
+      if (deletedIds.length) {
+        softDeletedMsat = Number(db.prepare(
+          `SELECT COALESCE(SUM(amount - ABS(COALESCE(fee, 0))), 0) AS msat FROM apipayments
+           WHERE wallet_id IN (${placeholders(deletedIds)}) AND (${sql.counted})`
+        ).get(...deletedIds).msat);
+      }
+    }
+  } catch (e) {
+    throw new DeletionError('assess', e.message);
+  } finally {
+    db.close();
+  }
+  let balanceMsat = softDeletedMsat;
+  for (const wallet of wallets.filter(w => !w.deleted)) balanceMsat += await readWalletBalance(wallet.adminkey);
+  return { wallets, balanceMsat, pendingOut };
+}
+
+function refuseDeletion(funds, acknowledgeBalance) {
+  if (funds.pendingOut > 0) return { status: 409, body: { error: 'payment_pending' } };
+  if (funds.balanceMsat > 0 && acknowledgeBalance !== true) {
+    return { status: 409, body: { error: 'balance_not_zero', balanceMsat: funds.balanceMsat } };
+  }
+  return null;
+}
+
+async function deleteAccount(pubkey, acknowledgeBalance) {
+  let mapping, sharers;
+  const pdb = openProvisionDb();
+  try {
+    mapping = pdb.prepare('SELECT user_id, wallet_id FROM provisioned WHERE pubkey = ?').get(pubkey);
+    if (mapping) {
+      sharers = pdb.prepare('SELECT COUNT(*) AS n FROM provisioned WHERE user_id = ? AND pubkey != ?')
+        .get(mapping.user_id, pubkey).n;
+    }
+  } catch (e) {
+    throw new DeletionError('mapping', e.message);
+  } finally {
+    pdb.close();
+  }
+  if (!mapping) return { status: 404, body: { error: 'not_found' } };
+  // One LNbits account per pubkey is the invariant provisioning keeps. If it is
+  // ever broken, deleting would take another pubkey's wallet with it.
+  if (sharers > 0) return { status: 409, body: { error: 'shared_account' } };
+  const userId = mapping.user_id;
+  // Equally, the mapped wallet must belong to the mapped LNbits account, or the
+  // steps below that key on the wallet id would reach someone else's records.
+  let owner;
+  const ownerDb = openDb(LNBITS_DB_PATH, { readOnly: true });
+  try {
+    owner = ownerDb.prepare('SELECT "user" AS user_id FROM wallets WHERE id = ?').get(mapping.wallet_id);
+  } catch (e) {
+    throw new DeletionError('mapping', e.message);
+  } finally {
+    ownerDb.close();
+  }
+  if (owner && owner.user_id !== userId) return { status: 409, body: { error: 'shared_account' } };
+
+  // 1. Nothing has changed yet; refusing here leaves the account untouched.
+  const before = await assessAccountFunds(userId);
+  const refused = refuseDeletion(before, acknowledgeBalance);
+  if (refused) return refused;
+
+  // 2. Revoke NWC grants while the wallet keys still authenticate.
+  let revoked = 0;
+  for (const wallet of before.wallets.filter(w => !w.deleted)) {
+    try {
+      revoked += (await nwcRoutes.revokeAll(wallet.adminkey, userId)).revoked;
+    } catch (e) {
+      throw new DeletionError('nwc', `status=${e.status ?? '-'} ${e.message}`, { upstream: true });
+    }
+  }
+
+  // 3. Release the Lightning Address. The mapped wallet is included even if
+  // LNbits no longer lists it, so a stray pay link cannot outlive the account.
+  const walletIds = [...new Set([mapping.wallet_id, ...before.wallets.map(w => w.id)])];
+  let lnurlpDb;
+  try {
+    lnurlpDb = openDb(LNURLP_DB_PATH);
+    lnurlpDb.prepare(`DELETE FROM pay_links WHERE wallet IN (${placeholders(walletIds)})`).run(...walletIds);
+  } catch (e) {
+    throw new DeletionError('lightning-address', e.message);
+  } finally {
+    lnurlpDb?.close();
+  }
+
+  // 4. Nothing new can pay in now. Anything that landed since step 1 counts.
+  const after = await assessAccountFunds(userId);
+  const refusedAfter = refuseDeletion(after, acknowledgeBalance);
+  if (refusedAfter) {
+    console.warn('[delete-account] funds arrived during deletion; address released, account kept');
+    return refusedAfter;
+  }
+
+  // 5. LNbits records, in one transaction on one file.
+  const db = openDb(LNBITS_DB_PATH);
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    // The mapped wallet is included even if its row is already gone, so rows
+    // keyed by it are still cleared when LNbits lost the wallet some other way.
+    const ids = [...new Set([mapping.wallet_id,
+      ...db.prepare('SELECT id FROM wallets WHERE "user" = ?').all(userId).map(w => w.id)])];
+    for (const [table, column, key] of LNBITS_ACCOUNT_ROWS) {
+      if (!tableColumns(db, table).has(column)) continue;
+      const values = key === 'user' ? [userId] : ids;
+      if (!values.length) continue;
+      db.prepare(`DELETE FROM ${JSON.stringify(table)} WHERE ${JSON.stringify(column)} IN (${placeholders(values)})`).run(...values);
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    throw new DeletionError('lnbits', e.message);
+  } finally {
+    db.close();
+  }
+
+  // 6. The mapping, and the anonymous record that a deletion happened.
+  const forfeitedMsat = Math.max(0, after.balanceMsat);
+  const proxyDb = openProvisionDb();
+  try {
+    proxyDb.exec('BEGIN IMMEDIATE');
+    const removed = proxyDb.prepare('DELETE FROM provisioned WHERE pubkey = ?').run(pubkey).changes;
+    if (removed) {
+      proxyDb.prepare('INSERT INTO account_deletions (deleted_at, forfeited_msat) VALUES (?, ?)')
+        .run(Math.floor(Date.now() / 1000), forfeitedMsat);
+    }
+    proxyDb.exec('COMMIT');
+  } catch (e) {
+    if (proxyDb.isTransaction) proxyDb.exec('ROLLBACK');
+    throw new DeletionError('mapping', e.message);
+  } finally {
+    proxyDb.close();
+  }
+
+  console.log(`[delete-account] account deleted: nwc_revoked=${revoked} forfeited_msat=${forfeitedMsat}`);
+  return { status: 200, body: { deleted: true } };
+}
+
 // ── Request handler ──
 
 const server = createServer(async (req, res) => {
@@ -521,7 +787,7 @@ const server = createServer(async (req, res) => {
     }
     let operationBody, operationRaw;
     if (isAuthPath) {
-      const bucket = parsedUrl.pathname === CHALLENGE_PATH ? 'challenge' : parsedUrl.pathname === AUTH_PATHS[0] ? 'provision' : parsedUrl.pathname === AUTH_PATHS[1] ? 'claim' : 'release';
+      const bucket = parsedUrl.pathname === CHALLENGE_PATH ? 'challenge' : AUTH_ROUTES[parsedUrl.pathname].bucket;
       if (!checkRateLimit(clientIp,bucket)) return jsonResponse(res,429,{error:'Too many requests'});
       try {
         operationRaw = await readBody(req);
@@ -533,8 +799,7 @@ const server = createServer(async (req, res) => {
         catch(e) { return jsonResponse(res,e.message.startsWith('Server busy')?503:400,{error:e.message}); }
       }
       const keys = Object.keys(operationBody).sort().join(',');
-      const expectedKey = parsedUrl.pathname === AUTH_PATHS[0] ? 'name' : parsedUrl.pathname === AUTH_PATHS[1] ? 'username' : '';
-      if (keys !== expectedKey) return jsonResponse(res,400,{error:'Unexpected operation fields'});
+      if (keys !== AUTH_ROUTES[parsedUrl.pathname].fields) return jsonResponse(res,400,{error:'Unexpected operation fields'});
     }
     const verifyOperation = () => {
       try { return auth.verify({authorization:req.headers.authorization,token:req.headers['x-nostr-transaction'],raw:operationRaw,url:BASE_URL+req.url,scope}); }
@@ -568,10 +833,10 @@ const server = createServer(async (req, res) => {
       if (!verified) return;
 
       // C2: Mutex to prevent duplicate wallet provisioning for the same pubkey
-      if (_provisioningPubkeys.has(verified.pubkey)) {
+      if (_busyPubkeys.has(verified.pubkey)) {
         return jsonResponse(res, 409, { error: 'Provisioning already in progress for this pubkey' });
       }
-      _provisioningPubkeys.add(verified.pubkey);
+      _busyPubkeys.add(verified.pubkey);
       try {
         // Check if this pubkey already has a wallet
         const existing = findWalletByPubkey(verified.pubkey);
@@ -588,7 +853,7 @@ const server = createServer(async (req, res) => {
           // would let it receive sats that no later provision could ever find.
           console.error(
             `[provision] ORPHANED WALLET user=${wallet.user} wallet=${wallet.id} ` +
-            `pubkey=${verified.pubkey} — created but not linked: ${e.message}`
+            `pubkey=${verified.pubkey.slice(0, 16)}...: created but not linked: ${e.message}`
           );
           return jsonResponse(res, 503, {
             error: 'Wallet created but could not be linked to your key. Do not retry; contact the operator.',
@@ -599,7 +864,7 @@ const server = createServer(async (req, res) => {
         console.error(`[provision] error: ${e.message}`);
         return jsonResponse(res, 502, { error: 'Failed to create wallet on LNbits backend' });
       } finally {
-        _provisioningPubkeys.delete(verified.pubkey);
+        _busyPubkeys.delete(verified.pubkey);
       }
     }
 
@@ -754,6 +1019,37 @@ const server = createServer(async (req, res) => {
         return jsonResponse(res, 500, { error: 'Failed to release Lightning Address' });
       } finally {
         lnurlpDb.close();
+      }
+    }
+
+    // POST /api/v2/delete-account: the signer deletes their own hosted account.
+    // The body names no account: the verified signer is the only identity used.
+    if (req.method === 'POST' && parsedUrl.pathname === '/api/v2/delete-account') {
+      const { confirm, acknowledgeBalance } = operationBody;
+      // Validated before verification, like the other routes, so a malformed
+      // request does not burn the caller's challenge.
+      if (confirm !== DELETE_CONFIRMATION || typeof acknowledgeBalance !== 'boolean') {
+        return jsonResponse(res, 400, { error: 'invalid_request' });
+      }
+
+      const verified = verifyOperation();
+      if (!verified) return;
+
+      if (_busyPubkeys.has(verified.pubkey)) {
+        return jsonResponse(res, 409, { error: 'in_progress' });
+      }
+      _busyPubkeys.add(verified.pubkey);
+      try {
+        const result = await deleteAccount(verified.pubkey, acknowledgeBalance);
+        return jsonResponse(res, result.status, result.body);
+      } catch (e) {
+        // Safe to retry: every step before the failing one is idempotent.
+        console.error(`[delete-account] failed at ${e.step || 'unknown'}: ${e.message}`);
+        return e.upstream
+          ? jsonResponse(res, 502, { error: 'upstream_unavailable' })
+          : jsonResponse(res, 500, { error: 'deletion_failed' });
+      } finally {
+        _busyPubkeys.delete(verified.pubkey);
       }
     }
 

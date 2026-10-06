@@ -1,5 +1,26 @@
 # Changelog
 
+## Account deletion
+
+- Add `POST /api/v2/delete-account` for in-app account deletion (App Store guideline
+  5.1.1(v)). It uses the v2 transaction flow, its own 3/min rate limit and the same
+  CORS policy as the other v2 routes. The signer's pubkey is the only identity used.
+- Body `{"confirm":"delete-account","acknowledgeBalance":<boolean>}`. 404 `not_found`
+  without an account; 409 `balance_not_zero` with `balanceMsat` while a balance is
+  unacknowledged; 409 `payment_pending` while an outgoing payment is in flight; 200
+  `{"deleted":true}` once done.
+- Revokes every NWC grant (expired ones included), releases the Lightning Address,
+  re-checks the balance, hard-deletes the LNbits wallet, account and their dependent
+  rows, then removes the pubkey mapping. Ordered and idempotent, so a failed call is
+  completed by a retry.
+- Records each deletion in a new `account_deletions` table holding only a timestamp
+  and the forfeited msat. It is created automatically; no migration step.
+- The orphaned-wallet error log now carries a 16-character pubkey prefix, like every
+  other log line, instead of the full pubkey.
+
+Purely additive to the client surface. LNbits limitations and operator checks are in
+[RUNBOOK.md](RUNBOOK.md#account-deletion).
+
 ## Wallet fee quotes
 
 - Allow `GET /api/v1/payments/fee-reserve` through the wallet API proxy, so a client

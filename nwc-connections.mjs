@@ -1,5 +1,9 @@
 /* global fetch, AbortSignal, URL */
-/** Wallet-scoped NWC management for the zaps proxy. Never receives pairing secrets. */
+/**
+ * Wallet-scoped NWC management for the zaps proxy. Never receives pairing secrets.
+ * The returned route handler also carries revokeAll(adminKey, userId), used by
+ * account deletion to remove every grant a wallet holds.
+ */
 import { DatabaseSync } from 'node:sqlite';
 const keyPattern = /^[a-f0-9]{64}$/;
 const basePath = '/api/nwc/connections';
@@ -94,13 +98,46 @@ export function createNwcRoutes({backend,dbPath,fetchFn=fetch}) {
       return true;
     }
   };
+  // Account deletion: revoke every grant the wallet holds, expired ones included,
+  // then list again and refuse to report success while any remain. Throws on any
+  // upstream failure so the caller deletes nothing else and a retry resumes here.
+  const revokeAll=async(key,userId)=>{
+    const db=new DatabaseSync(dbPath);
+    db.exec('PRAGMA busy_timeout = 5000');
+    try {
+      const enabled=db.prepare("SELECT active FROM installed_extensions WHERE id='nwcprovider'").get();
+      // A provider that is not installed and active serves no grants and has no API to call.
+      if(!enabled?.active) return {revoked:0,providerAvailable:false};
+      const userExtension=db.prepare("SELECT active FROM extensions WHERE user=? AND extension='nwcprovider'").get(userId);
+      // PUT enables the extension before registering a grant, so no row means none were registered.
+      if(!userExtension) return {revoked:0,providerAvailable:true};
+      // LNbits refuses extension API calls for a user who has it disabled. Deleting the
+      // account is an explicit user action, and the row is removed with the account.
+      if(!userExtension.active) db.prepare("UPDATE extensions SET active=1 WHERE user=? AND extension='nwcprovider'").run(userId);
+      const listAll=()=>upstream(key,'/nwcprovider/api/v1/nwc?include_expired=true');
+      let revoked=0;
+      for(const row of await listAll()) {
+        const clientPubkey=row?.data?.pubkey;
+        if(!keyPattern.test(clientPubkey||'')) {const e=new Error('Invalid connection listing');e.status=502;throw e;}
+        await upstream(key,`/nwcprovider/api/v1/nwc/${clientPubkey}`,'DELETE');
+        revoked++;
+      }
+      if((await listAll()).length) {const e=new Error('Connections remain after revocation');e.status=502;throw e;}
+      return {revoked,providerAvailable:true};
+    } finally {db.close();}
+  };
   const mutations=new Map();
-  return async(req,res,url)=>{
-    if(!['PUT','DELETE'].includes(req.method)) return handle(req,res,url);
-    const key=req.headers['x-api-key'];
+  const serialize=async(key,operation)=>{
     const previous=mutations.get(key) || Promise.resolve();
-    const current=previous.catch(()=>{}).then(()=>handle(req,res,url));
+    const current=previous.catch(()=>{}).then(operation);
     mutations.set(key,current);
     try {return await current;} finally {if(mutations.get(key)===current)mutations.delete(key);}
   };
+  const route=async(req,res,url)=>{
+    if(!['PUT','DELETE'].includes(req.method)) return handle(req,res,url);
+    return serialize(req.headers['x-api-key'],()=>handle(req,res,url));
+  };
+  // Shares the per-key queue with PUT/DELETE so a grant cannot be registered mid-revocation.
+  route.revokeAll=(key,userId)=>serialize(key,()=>revokeAll(key,userId));
+  return route;
 }
