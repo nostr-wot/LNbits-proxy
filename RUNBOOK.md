@@ -132,6 +132,151 @@ tail -20 /srv/zaps-monitor/cron.log
 Check `zaps-monitor.env` is readable and mode 600. Alerting needs two consecutive
 failures by default.
 
+## Inbound liquidity
+
+phoenixd receives through a single channel to ACINQ's LSP. When a deposit does not fit
+the channel's inbound liquidity, phoenixd buys more on the fly and takes the whole fee,
+mining plus LSP service fee, out of **that one deposit**. LNbits records it as a fee on
+the incoming payment and credits the user `amount - fee`.
+
+What this cost once: auto-liquidity bought about 2M sat inbound in March. On 2026-09-30
+the LSP spliced 1,994,225 sat of it back out because it was unused (capacity fell to
+69,775 sat) and nobody noticed. On 2026-10-07 a deposit of just under 100k sat did not
+fit the ~40k left; phoenixd bought about 2.1M sat and charged 21,476 sat to that user. The
+absolute fee cap did not help: phoenixd applies it to the mining fee only.
+
+The monitor now reports each step of that before a user pays for it. Everything below
+assumes phoenixd's API on `127.0.0.1:9740`:
+
+```bash
+PASS=$(grep '^http-password=' /home/phoenixd/.phoenix/phoenix.conf | head -1 | cut -d= -f2)
+curl -s -u ":$PASS" http://127.0.0.1:9740/getinfo | jq '{version, channels}'
+```
+
+### The alerts
+
+| Mail | Meaning | Do |
+|---|---|---|
+| `ALERT: Inbound Liquidity failing` | Inbound below the floor, no channel, or a channel not `Normal` | Buy liquidity deliberately (below) before the next deposit does it for you. A non-`Normal` channel right after a restart is usually `Offline`/`Syncing` and clears; the alert needs two consecutive runs. |
+| `ALERT: channel capacity dropped by N sat (LSP splice-out?)` | A channel's capacity fell between runs | Confirm in `phoenix.log` (`grep -i splice`). Expect the Inbound Liquidity alert next. Buy liquidity deliberately. |
+| `ALERT: phoenixd bought inbound liquidity (automatic, fee N sat)` | phoenixd made an on-the-fly purchase | The mail lists the LNbits deposits charged for it. Refund them (below). |
+| `NOTICE: ... (manual, ...)` | A manual purchase was recorded | Expected if you made one. |
+| `ALERT: user charged a node fee on a deposit` | A settled LNbits deposit carries a nonzero fee, whatever the cause | Refund (below). A deposit turned entirely into phoenixd fee credit shows a fee equal to its amount. |
+| `ALERT: Liquidity Audit failing` | Purchases or deposit fees could not be read | Fix it: until then the two alerts above cannot fire. The message names the failing source. |
+
+Wallet ids and payment hashes in the mail are prefixes. Purchase and deposit mails are
+sent once each; the state lives under `liquidity_tracking` in
+`/srv/zaps-monitor/state.json`. The first run after deploying this looks back
+`LIQUIDITY_LOOKBACK_HOURS` (48 by default), so it reports the 2026-10-07 purchase once.
+
+### Permissions
+
+The liquidity checks read two files:
+
+- `PHOENIX_CONF`: already read every run by the Phoenixd Node check, so nothing new.
+  It now prefers `http-password-limited-access` (read-only API access, enough for
+  `/getinfo` and listing payments) and falls back to `http-password`.
+- `LNBITS_DB_PATH`: opened read-only. `cleanup.py`, run by the same monitor, already
+  opens it read-write.
+
+So wherever the monitor runs today it already has the access it needs. In the reference
+deployment that is root's crontab (`crontab -l` as root shows the `run-monitor.sh`
+line). Check after deploying:
+
+```bash
+/srv/zaps-monitor/run-monitor.sh && tail -1 /srv/zaps-monitor/monitor.log | jq '.checks[] | select(.id|startswith("liquidity"))'
+```
+
+If you move the monitor to an unprivileged user, grant that user alone what it needs
+rather than loosening the files. `phoenix.conf` holds the full-access API password and
+must not become group or world readable:
+
+```bash
+setfacl -m u:zapsmon:x /home/phoenixd /home/phoenixd/.phoenix
+setfacl -m u:zapsmon:r /home/phoenixd/.phoenix/phoenix.conf
+setfacl -m u:zapsmon:x /home/lnbits /home/lnbits/lnbits /home/lnbits/lnbits/data
+setfacl -m u:zapsmon:r /home/lnbits/lnbits/data/database.sqlite3
+```
+
+A read-only SQLite open of a WAL database also needs the `-wal` and `-shm` files
+readable; `cleanup.py` needs write access, so an unprivileged monitor user would have
+to run cleanup some other way.
+
+### phoenixd liquidity policy
+
+Read this against the installed version (`version` in `/getinfo`); option names have
+changed between releases. The following is from phoenixd's source as of v0.9.2
+(September 2026) and https://phoenix.acinq.co/server/auto-liquidity. Settings go in
+`/home/phoenixd/.phoenix/phoenix.conf` as `name=value` without the leading `--`, and
+take effect when phoenixd restarts. Schedule that restart; never fold it into a proxy
+deploy.
+
+- `auto-liquidity` (`off`, `2m`, `5m`, `10m`; default `2m`): how much inbound to buy on
+  top of what the payment needs.
+- `max-mining-fee` (5,000 to 200,000 sat; default 1% of auto-liquidity): caps the
+  **mining fee only**. `max-absolute-fee` is gone and phoenixd refuses to start with it.
+  phoenixd hardcodes `considerOnlyMiningFeeForAbsoluteFeeCheck=true`; no conf option
+  makes the absolute cap cover the service fee. phoenixd logs this cap as
+  `maxAbsoluteFee`, which is why a 20,000 sat "max absolute fee" still allowed a
+  21,476 sat charge.
+- `max-relative-fee-percent` (1 to 50; default 30, not shown in `--help`): the only cap
+  on the **total** fee, as a percentage of the incoming payment that triggers the
+  purchase. The 21,476 sat fee was over 20% of the deposit, under the default.
+- `max-fee-credit` (`off`, `50k`, `125k`, `250k`; default 2.5% of auto-liquidity): small
+  payments that cannot cover a purchase are kept as fee credit instead.
+
+Recommendation: set `max-relative-fee-percent` low, for example `5`. A deposit that
+does not fit and cannot pay a purchase within 5% of its own amount is then rejected:
+the payer sees a failed payment and retries later, instead of a user silently losing a
+fifth of their deposit. Pair it with the monitor's Inbound Liquidity floor so you buy
+liquidity before that happens. Consider `max-fee-credit=off` too, so a small deposit
+is never swallowed as fee credit. Rejections appear in `phoenix.log` as
+`lightning payment rejected ... over relative fee`.
+
+### Buying liquidity deliberately
+
+phoenixd's API has no "buy liquidity" call; a purchase happens when an incoming payment
+does not fit. So make the operator, not a user, send that payment, straight to phoenixd
+rather than to an LNbits wallet:
+
+```bash
+PASS=$(grep '^http-password=' /home/phoenixd/.phoenix/phoenix.conf | head -1 | cut -d= -f2)
+# 1. What a purchase of the auto-liquidity size costs right now
+curl -s -u ":$PASS" "http://127.0.0.1:9740/estimateliquidityfees?amountSat=2000000"
+# 2. An invoice on the node itself, bigger than the inbound left and than the fee
+curl -s -u ":$PASS" -X POST http://127.0.0.1:9740/createinvoice \
+  -d amountSat=150000 -d description='operator liquidity top-up'
+```
+
+The `phoenix-cli estimateliquidityfees` and `phoenix-cli createinvoice` commands do the
+same. Pay the invoice from an operator wallet outside this node (a hosted LNbits wallet
+here would be paying itself). The amount must exceed the remaining
+inbound (so it does not fit), and the fee must stay within `max-relative-fee-percent`
+of it: with the setting at 5% and a ~21,000 sat fee, send at least ~430,000 sat, or
+raise the setting for the top-up and restore it after. phoenixd buys `auto-liquidity`
+plus the payment amount and takes the fee from the operator's payment; what is left
+stays as node balance, outside every LNbits wallet. Expect an `ALERT: phoenixd bought
+inbound liquidity` mail saying no LNbits deposit carried a fee, and Inbound Liquidity
+recovering on the next run.
+
+### Refunding a user charged a liquidity fee
+
+The alert gives the wallet id prefix, the amount, the fee and a payment hash prefix.
+
+```bash
+sqlite3 -readonly /home/lnbits/lnbits/data/database.sqlite3 \
+  "SELECT wallet_id, amount/1000 AS sat, fee/1000 AS fee_sat,
+          datetime(COALESCE(updated_at, created_at), 'unixepoch') AS settled
+     FROM apipayments WHERE payment_hash LIKE '<hash prefix>%' AND amount > 0"
+```
+
+Credit the fee back to that wallet as the LNbits super user: the admin UI (Users, the
+wallet, credit) or `PUT /users/api/v1/balance` with `{"id":"<wallet id>","amount":<fee in
+sat>,"memo":"Refund of node liquidity fee"}` under a super-user session. Amounts there
+are sats. The credit is backed by the node's own balance: the operator absorbs the fee,
+so check the node balance still covers every LNbits wallet afterwards. Do not edit
+`apipayments.fee` by hand.
+
 ## Account deletion
 
 `POST /api/v2/delete-account` is the in-app "delete my account" path (App Store

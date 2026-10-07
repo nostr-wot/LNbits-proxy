@@ -1,5 +1,25 @@
 # Changelog
 
+## Liquidity monitoring
+
+- The monitor now watches phoenixd's inbound liquidity (`monitor/liquidity.mjs`). It
+  alerts when inbound liquidity is below `LIQUIDITY_MIN_INBOUND_SAT` (200,000 sat) or
+  `LIQUIDITY_DEPOSIT_MULTIPLE` (2) times the largest deposit of the last 30 days, when
+  there is no channel, or when one is not `Normal`; it reminds every 12 hours and mails
+  a recovery.
+- Mails when a channel's capacity drops by `LIQUIDITY_CAPACITY_DROP_SAT` (100,000 sat)
+  or more between runs, which is how an LSP splice-out of leased liquidity shows up.
+- Mails every liquidity purchase phoenixd records, with its fee and the LNbits deposits
+  charged for it, and every settled LNbits deposit with a nonzero fee, so the affected
+  user can be refunded. Wallet ids and hashes appear as prefixes only.
+- Event mail is deduplicated in the state file and retried on the next run if the mail
+  provider rejects it. A new Liquidity Audit check fails while the data behind these
+  alerts cannot be read.
+- The monitor prefers phoenixd's `http-password-limited-access` and honours
+  `PHOENIX_URL`. It opens the LNbits database read-only and needs no new permissions.
+- RUNBOOK documents the alerts, the phoenixd fee settings that actually bound what a
+  user can be charged, buying liquidity deliberately and refunding users.
+
 ## Account deletion
 
 - Add `POST /api/v2/delete-account` for in-app account deletion (App Store guideline

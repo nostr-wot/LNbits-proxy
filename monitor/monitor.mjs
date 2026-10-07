@@ -7,6 +7,9 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { decide } from './alert-policy.mjs';
+import {
+  liquidityConfig, openLnbitsReader, phoenixdClient, readPhoenixPassword, runLiquidity,
+} from './liquidity.mjs';
 import { readFileSync, writeFileSync, statSync, renameSync, appendFileSync } from 'node:fs';
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -27,6 +30,11 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_FROM     = process.env.EMAIL_FROM || 'Zaps Monitor <alarms@dandelionlabs.io>';
 const EMAIL_TO       = process.env.EMAIL_TO   || 'leon@nostr-wot.com';
 const PHOENIX_CONF   = process.env.PHOENIX_CONF || '/home/phoenixd/.phoenix/phoenix.conf';
+const PHOENIX_URL    = process.env.PHOENIX_URL  || 'http://127.0.0.1:9740';
+const LNBITS_DB_PATH = process.env.LNBITS_DB_PATH || '/home/lnbits/lnbits/data/database.sqlite3';
+// Inbound liquidity, LSP splice-outs, liquidity purchases and fees charged to
+// deposits. See monitor/liquidity.mjs and the LIQUIDITY_* variables in README.
+const LIQUIDITY      = liquidityConfig(process.env);
 
 // End-to-end check. It mints a real invoice on every run, so it needs its own
 // address, a short expiry, and the cleanup helper to retire what it created.
@@ -69,11 +77,12 @@ function log(entry) {
   appendFileSync(LOG_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
 }
 
-function getPhoenixdPassword() {
-  const conf = readFileSync(PHOENIX_CONF, 'utf8');
-  const m = conf.match(/^http-password=(\S+)/m);
-  if (!m) throw new Error('http-password not found in phoenix.conf');
-  return m[1];
+// The last /getinfo body this run read, shared with the liquidity checks so
+// they do not query phoenixd a second time.
+let phoenixdInfo = null;
+
+function phoenixd() {
+  return phoenixdClient({ url: PHOENIX_URL, password: readPhoenixPassword(PHOENIX_CONF), timeoutMs: TIMEOUT_MS });
 }
 
 async function f(url, opts = {}) {
@@ -115,13 +124,8 @@ async function checkLnurl(name) {
 }
 
 async function checkPhoenixd() {
-  const pw = getPhoenixdPassword();
-  const auth = 'Basic ' + Buffer.from(':' + pw).toString('base64');
-  const r = await f('http://127.0.0.1:9740/getinfo', {
-    headers: { Authorization: auth },
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const d = await r.json();
+  const d = await phoenixd().getinfo();
+  phoenixdInfo = d;
   const channels = (d.channels || []).filter(c => c.state === 'Normal');
   if (channels.length === 0) throw new Error('no channels in Normal state');
   const bal = channels.reduce((sum, c) => sum + (c.balanceSat || 0), 0);
@@ -162,6 +166,7 @@ async function checkCallbackE2E() {
 
 // ── Alerting ────────────────────────────────────────────────────────────────
 
+// Returns whether the provider accepted the mail.
 async function sendEmail(subject, body) {
   try {
     const r = await fetch(RESEND_URL, {
@@ -178,8 +183,10 @@ async function sendEmail(subject, body) {
       }),
     });
     if (!r.ok) console.error('email send failed:', await r.text());
+    return r.ok;
   } catch (err) {
     console.error('email send error:', err.message);
+    return false;
   }
 }
 
@@ -207,11 +214,35 @@ async function main() {
     results.push({ id: check.id, label: check.label, ok, msg });
   }
 
+  // Liquidity: persistent conditions join the results below; one-off events
+  // (splice-outs, purchases, fees charged to deposits) come back as mail.
+  let liquidity = { checks: [], emails: [], state: state.liquidity_tracking };
+  if (LIQUIDITY.enabled) {
+    try {
+      liquidity = await runLiquidity({
+        info: phoenixdInfo,
+        phoenixd: phoenixdInfo ? phoenixd() : null,
+        openLnbits: () => openLnbitsReader(LNBITS_DB_PATH),
+        state: state.liquidity_tracking,
+        now,
+        config: LIQUIDITY,
+      });
+    } catch (e) {
+      // A bug here must not take the other checks' alerting down with it.
+      liquidity.checks = [{ id: 'liquidity_audit', label: 'Liquidity Audit', ok: false, msg: `liquidity checks crashed: ${e.message}` }];
+    }
+    results.push(...liquidity.checks);
+  }
+
   for (const r of results) {
+    // ok === null: this run could not tell (its source was unreachable and has
+    // its own check). Leave the state alone rather than count a pass or a failure.
+    if (r.ok === null) continue;
     const { state: next, email } = decide(state[r.id], r.ok, now, {
-      alertAfter: ALERT_AFTER, reminderMs: REMINDER_MS,
+      alertAfter: r.alertAfter ?? ALERT_AFTER, reminderMs: r.reminderMs ?? REMINDER_MS,
     });
     state[r.id] = next;
+    const hint = r.hint ? `\n\n${r.hint}` : '';
 
     if (email?.kind === 'recovered') {
       await sendEmail(
@@ -221,21 +252,34 @@ async function main() {
     } else if (email?.kind === 'alert') {
       await sendEmail(
         `ALERT: ${r.label} failing`,
-        `${r.label} is failing!\n\nError: ${r.msg}\nConsecutive failures: ${email.fails}\nTime: ${new Date().toISOString()}`
+        `${r.label} is failing!\n\nError: ${r.msg}\nConsecutive failures: ${email.fails}\nTime: ${new Date().toISOString()}${hint}`
       );
     } else if (email?.kind === 'reminder') {
       await sendEmail(
         `STILL FAILING: ${r.label} (${email.minutes} min)`,
-        `${r.label} is still failing.\n\nError: ${r.msg}\nDowntime: ~${email.minutes} minutes\nTime: ${new Date().toISOString()}`
+        `${r.label} is still failing.\n\nError: ${r.msg}\nDowntime: ~${email.minutes} minutes\nTime: ${new Date().toISOString()}${hint}`
       );
     }
   }
 
+  // Event mail is deduped through the tracking state, so that state only moves
+  // forward once every event mail was accepted. Otherwise the next run sends again.
+  let eventsSent = true;
+  for (const e of liquidity.emails) {
+    if (!(await sendEmail(e.subject, `${e.body}\n\nTime: ${new Date().toISOString()}`))) eventsSent = false;
+  }
+  if (eventsSent) state.liquidity_tracking = liquidity.state;
+
   saveState(state);
 
-  const summary = results.map(r => `${r.ok ? '✓' : '✗'} ${r.label}`).join(', ');
-  const allOk = results.every(r => r.ok);
-  log({ status: allOk ? 'OK' : 'FAIL', checks: results.map(({ id, ok, msg }) => ({ id, ok, msg })) });
+  const mark = ok => (ok === null ? '?' : ok ? '✓' : '✗');
+  const summary = results.map(r => `${mark(r.ok)} ${r.label}`).join(', ');
+  const allOk = results.every(r => r.ok !== false);
+  log({
+    status: allOk ? 'OK' : 'FAIL',
+    checks: results.map(({ id, ok, msg }) => ({ id, ok, msg })),
+    ...(liquidity.emails.length ? { events: liquidity.emails.map(e => e.subject), eventsSent } : {}),
+  });
   console.log(`[${new Date().toISOString()}] ${allOk ? 'ALL OK' : 'FAILURES'}: ${summary}`);
 }
 

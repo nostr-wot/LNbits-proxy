@@ -268,12 +268,51 @@ configuration.
   proxy, the LNURL paths, the Lightning backend and end-to-end invoice generation, and
   emails on state change. Alerting requires two consecutive failures
   (`MONITOR_ALERT_AFTER`), so a single blip stays quiet.
+- **`monitor/liquidity.mjs`**: run by the monitor each time. Watches the node's inbound
+  liquidity so a user is never the first to find out it ran out:
+  - **Inbound Liquidity** fails when total inbound liquidity is below
+    `LIQUIDITY_MIN_INBOUND_SAT`, or below `LIQUIDITY_DEPOSIT_MULTIPLE` times the largest
+    deposit of the last `LIQUIDITY_DEPOSIT_WINDOW_DAYS`, when there is no channel, or when a
+    channel is not `Normal`. It alerts once, reminds every `LIQUIDITY_REMINDER_HOURS`, and
+    mails a recovery.
+  - **Capacity drop** mails when a channel's capacity falls by `LIQUIDITY_CAPACITY_DROP_SAT`
+    or more between runs: the signature of the LSP splicing out unused leased liquidity.
+  - **Liquidity purchase** mails for every `auto_liquidity` (and `manual_liquidity`)
+    payment phoenixd records, with its fee and the LNbits deposits charged for it.
+  - **Node fee on a deposit** mails for every settled LNbits incoming payment with a
+    nonzero fee, whatever the cause: that user was credited less than they were paid.
+  - **Liquidity Audit** fails while the purchase or deposit data cannot be read, so the
+    checks above cannot go quiet unnoticed.
+
+  The events are deduplicated in the state file and only marked sent once the mail
+  provider accepts them. See [RUNBOOK.md](RUNBOOK.md#inbound-liquidity).
 - **`monitor/cleanup.py`** — retires the invoice the end-to-end check mints, and can prune
   expired unpaid invoices. It deletes only after the Lightning backend confirms an invoice
   was never paid, takes a dated database backup first, and re-checks its conditions inside
   the `DELETE` so a payment settling mid-prune is never discarded.
 - **`monitor/check-phoenixd.*`** — systemd timer that restarts phoenixd when its HTTP API
   stops responding. See [`monitor/PHOENIXD-WATCHDOG.md`](monitor/PHOENIXD-WATCHDOG.md).
+
+### Monitor configuration
+
+Set in `zaps-monitor.env` (see `.env.example`). The checks above the liquidity ones are
+documented in `.env.example`; the liquidity checks take:
+
+| Variable | Default | Description |
+|---|---|---|
+| `LIQUIDITY_CHECKS` | `1` | `0` turns the liquidity checks off |
+| `PHOENIX_CONF` | `/home/phoenixd/.phoenix/phoenix.conf` | Source of the API password; `http-password-limited-access` is preferred over `http-password` |
+| `PHOENIX_URL` | `http://127.0.0.1:9740` | phoenixd HTTP API |
+| `LNBITS_DB_PATH` | `/home/lnbits/lnbits/data/database.sqlite3` | LNbits database, opened read-only |
+| `LIQUIDITY_MIN_INBOUND_SAT` | `200000` | Inbound liquidity floor |
+| `LIQUIDITY_DEPOSIT_MULTIPLE` | `2` | Floor rises to this multiple of the largest recent deposit; `0` disables |
+| `LIQUIDITY_DEPOSIT_WINDOW_DAYS` | `30` | What "recent" means for that deposit |
+| `LIQUIDITY_CAPACITY_DROP_SAT` | `100000` | Capacity drop between runs that alerts |
+| `LIQUIDITY_REMINDER_HOURS` | `12` | Reminder interval while low liquidity persists |
+| `LIQUIDITY_LOOKBACK_HOURS` | `48` | How far back the first run looks for purchases and charged deposits |
+| `LIQUIDITY_MATCH_WINDOW_MINUTES` | `30` | How close to a purchase a charged deposit must settle to be attributed to it |
+
+The LNbits reader uses `node:sqlite`, so the monitor needs Node 24 like the proxy.
 
 ## When something breaks
 
