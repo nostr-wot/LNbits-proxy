@@ -6,6 +6,14 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
+## 1.0.1 — 2026-10-08
+
+- Point `scripts/zaps-autodeploy.service` at `/srv/LNbits-proxy`, the checkout
+  `deploy.sh` is actually run from. It named `/srv/zaps-provision/checkout`, a path
+  that does not exist on the host, so the timer would have failed on its first tick
+  with a missing working directory. Both lines are called out as the thing to change
+  if the checkout ever moves.
+
 ## 1.0.0 — 2026-10-08
 
 The first tagged release. The service has been running and deploying for some time;
