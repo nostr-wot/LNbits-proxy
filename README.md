@@ -283,9 +283,11 @@ therefore nothing is deployed.
 ### Automatic deployment
 
 The box pulls; nothing is pushed to it. `scripts/zaps-autodeploy.timer` runs
-`scripts/auto-deploy.sh` every 15 minutes from a checkout at
-`/srv/zaps-provision/checkout`; it deploys the newest published release with
-`./deploy.sh --ref <tag>` and records what is live in `deployed-version`.
+`scripts/auto-deploy.sh` every 15 minutes from the checkout, which the unit expects
+at `/srv/LNbits-proxy`; it deploys the newest published release with
+`./deploy.sh --ref <tag>` and records what is live in `deployed-version`. If your
+checkout is elsewhere, change `WorkingDirectory` and `ExecStart` in
+`scripts/zaps-autodeploy.service` to match before installing it.
 
 ```bash
 ZAPS_DRY_RUN=1 ./scripts/auto-deploy.sh   # decide and report, change nothing

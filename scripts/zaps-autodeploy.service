@@ -5,9 +5,12 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# The checkout is the source of truth; deploy.sh refuses to run from a dirty tree.
-WorkingDirectory=/srv/zaps-provision/checkout
-ExecStart=/srv/zaps-provision/checkout/scripts/auto-deploy.sh
+# The checkout deploy.sh is run from, which is the source of truth; it refuses to
+# run from a dirty tree. This is the one thing to change if your checkout is
+# somewhere else: both lines must name the same directory, and `systemctl status
+# zaps-autodeploy` says so immediately if they do not.
+WorkingDirectory=/srv/LNbits-proxy
+ExecStart=/srv/LNbits-proxy/scripts/auto-deploy.sh
 # deploy.sh installs systemd units and writes under /usr/local/bin, so this needs
 # root. It is the same work the operator did by hand, on a timer.
 User=root
