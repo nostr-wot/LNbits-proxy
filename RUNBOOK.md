@@ -361,9 +361,32 @@ pubkey also maps to. That should never happen; check `provisioned` for duplicate
 
 ## Rolling back
 
+Stop the timer first, or it will redeploy the release you are rolling away from on
+its next tick:
+
 ```bash
+sudo systemctl disable --now zaps-autodeploy.timer
 cd /srv/LNbits-proxy && ./deploy.sh --ref <previous-commit>
 ```
+
+To roll back to the previous release and stay there, mark the bad release a
+pre-release on GitHub and re-enable the timer: the deployer skips pre-releases and
+will deploy the newest published one instead. Record what you want live in
+`deployed-version` if you want the timer to leave the box alone entirely.
+
+### Restoring the wallet mapping
+
+Deploys copy it into `$PROVISION_DIR/backups/provisioning.sqlite3.bak-<stamp>`
+(newest ten kept). It is a plain SQLite file; stop the proxy, copy it back over
+`provisioning.sqlite3`, `chmod 600` it, and start the proxy. Check it first:
+
+```bash
+sqlite3 <backup> 'select count(*) from provisioned;'
+```
+
+A mapping restored from a stamp older than the last provisioning leaves the users
+provisioned since then looking new, and they will be given fresh wallets. Prefer the
+newest backup that opens.
 
 Or restore the dated backups the last deploy left beside the live files and restart the
 proxy process. Restore `monitor.mjs` from the **same backup stamp** along with the proxy

@@ -1,5 +1,37 @@
 # Changelog
 
+Sections above a release heading are unreleased. On release, the `Unreleased`
+heading is renamed to the bare version (`## 1.1.0 — YYYY-MM-DD`): the release
+workflow reads the section whose heading is that exact version and refuses a tag
+with no such section, so the name matters. Entries from before this convention keep
+their descriptive headings.
+
+## Unreleased
+
+### Releases and deployment
+
+- `.github/workflows/tests.yml` runs `npm test`, `npm run test:cleanup` and
+  `npm run check` on Node 24 for every push to `main` and every pull request.
+  Superseded runs are cancelled and a tag push does not re-trigger it.
+- `.github/workflows/release.yml` turns a `v*` tag into a published GitHub release,
+  but only after the suite passes, `scripts/check-release.mjs` confirms the tag,
+  `package.json` and `CHANGELOG.md` agree, and the tag is an ancestor of `main`.
+  Release notes come from the changelog section.
+- `scripts/auto-deploy.sh` with `scripts/zaps-autodeploy.{service,timer}` deploys
+  from the box's own side: it polls for the newest published release every 15
+  minutes and runs `./deploy.sh --ref <tag>`. Nothing is pushed to the host, so no
+  deploy key, no SSH access and no host address exist anywhere in this public
+  repository. It refuses drafts, pre-releases, tags that are not `vMAJOR.MINOR.PATCH`,
+  tags absent after a fetch, and tags outside `origin/main`; a failed deploy is not
+  recorded, so the next tick retries instead of believing a version is live.
+- `scripts/backup-provision-db.mjs` copies the pubkey-to-wallet mapping with
+  `VACUUM INTO` before the deploy migrates it, verifies the copy opens, keeps the
+  newest ten and refuses to proceed if the mapping cannot be read. `deploy.sh`
+  previously backed up only code: losing this table hands every returning user a new
+  wallet and strands the funds in the old one.
+- `deploy.sh` now prunes its own code backups to the newest ten per file. On a timer
+  they would otherwise accumulate until the disk filled.
+
 ## Liquidity monitoring
 
 - The monitor now watches phoenixd's inbound liquidity (`monitor/liquidity.mjs`). It

@@ -1,0 +1,16 @@
+[Unit]
+Description=Deploy the newest published LNbits-proxy release if it is not already live
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The checkout is the source of truth; deploy.sh refuses to run from a dirty tree.
+WorkingDirectory=/srv/zaps-provision/checkout
+ExecStart=/srv/zaps-provision/checkout/scripts/auto-deploy.sh
+# deploy.sh installs systemd units and writes under /usr/local/bin, so this needs
+# root. It is the same work the operator did by hand, on a timer.
+User=root
+# One deploy can legitimately take a couple of minutes: npm ci, a migration and a
+# verification pass. Past that something is wrong and the old version is still live.
+TimeoutStartSec=900

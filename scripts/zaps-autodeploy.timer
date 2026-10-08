@@ -1,0 +1,14 @@
+[Unit]
+Description=Look for a new LNbits-proxy release every 15 minutes
+
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=900
+# A release is not urgent to the minute, and a loose window keeps this off the
+# same tick as every other timer on the box.
+AccuracySec=60
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

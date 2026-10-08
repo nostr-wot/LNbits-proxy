@@ -1,0 +1,51 @@
+# Runs on every push and pull request. Minutes are free on a public repository, so
+# the restraint here is about waste and clarity rather than cost: one Node version,
+# no matrix, superseded runs cancelled, and nothing at all for a docs-only change.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+    # Nothing in the suite reads prose. A tag still runs everything, in release.yml.
+    paths-ignore: ['**.md', 'LICENSE']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**.md', 'LICENSE']
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run pointless. Cancel it.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # auto-deploy.test.mjs builds its own fixture repositories and never reads
+          # this history, so there is nothing to gain from fetching it.
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # Only nostr-tools, but the lockfile is what production installs.
+      - run: npm ci
+
+      # Proxy tests: these spawn the real server against temporary SQLite files and
+      # a stub LNbits. Nothing reaches a live wallet, and no credentials are needed.
+      - run: npm test
+
+      # Monitor cleanup tests (python, stdlib unittest; ubuntu-latest ships python3).
+      - run: npm run test:cleanup
+
+      - run: npm run check

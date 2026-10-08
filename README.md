@@ -258,8 +258,56 @@ process, and verifies the result.
 ./deploy.sh --ref <ref>  # roll back to a specific ref
 ```
 
+Before migrating the mapping it copies it with `scripts/backup-provision-db.mjs`
+(`VACUUM INTO`, verified by reopening the copy) into `$PROVISION_DIR/backups`, keeping
+the newest ten, and aborts without restarting if that copy cannot be made. Code
+backups beside the installed files are pruned to the newest ten per file.
+
 Put a reverse proxy in front for TLS; see the self-hosting guide for a worked nginx
 configuration.
+
+### Releasing
+
+Merging to `main` never touches production. A release is a deliberate act:
+
+1. Move the `Unreleased` entries in `CHANGELOG.md` under a `## <version> — <date>`
+   heading and set the same version in `package.json`.
+2. Tag it: `git tag v<version> && git push origin v<version>`.
+
+`.github/workflows/release.yml` then runs the suite, checks that the tag,
+`package.json` and the changelog agree (`scripts/check-release.mjs`), checks the tag
+is an ancestor of `main`, and publishes the GitHub release with that changelog
+section as its notes. Any of those failing means no release is published, and
+therefore nothing is deployed.
+
+### Automatic deployment
+
+The box pulls; nothing is pushed to it. `scripts/zaps-autodeploy.timer` runs
+`scripts/auto-deploy.sh` every 15 minutes from a checkout at
+`/srv/zaps-provision/checkout`; it deploys the newest published release with
+`./deploy.sh --ref <tag>` and records what is live in `deployed-version`.
+
+```bash
+ZAPS_DRY_RUN=1 ./scripts/auto-deploy.sh   # decide and report, change nothing
+```
+
+There is deliberately no deploy key, no inbound SSH and no host address in this
+repository. The script refuses a draft or pre-release, a tag that is not
+`vMAJOR.MINOR.PATCH`, a tag that is absent after fetching, and a tag outside
+`origin/main` — so publishing or tagging alone cannot put unreviewed code into
+production. A failed deploy is not recorded, so the next tick retries rather than
+assuming a version is live; `deploy.sh` leaves the previous version serving when it
+aborts. To hold a release back, keep it a draft or a pre-release.
+
+Install the units once, from the checkout:
+
+```bash
+sudo install -m 0644 scripts/zaps-autodeploy.service /etc/systemd/system/
+sudo install -m 0644 scripts/zaps-autodeploy.timer   /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now zaps-autodeploy.timer
+journalctl -u zaps-autodeploy.service -n 50    # what it last decided
+sudo systemctl disable --now zaps-autodeploy.timer   # stop automatic deploys
+```
 
 ## Monitoring
 

@@ -72,6 +72,16 @@ done
 [ -f "$MONITOR_DIR/cleanup.py" ] && run cp -a "$MONITOR_DIR/cleanup.py" "$MONITOR_DIR/cleanup.py.bak-$STAMP"
 echo "  backup stamp: $STAMP"
 
+# Keep the recent ones only. Deploys used to be occasional and manual; on a timer
+# these accumulate until something fills the disk.
+if [ "$DRY_RUN" -eq 0 ]; then
+  for d in "$PROVISION_DIR" "$MONITOR_DIR"; do
+    for base in server.js nwc-connections.mjs auth-v2.mjs monitor.mjs cleanup.py; do
+      ls -1t "$d/$base".bak-* 2>/dev/null | tail -n +11 | while read -r stale; do rm -f -- "$stale"; done
+    done
+  done
+fi
+
 say "Installing the proxy into $PROVISION_DIR"
 run install -m 0644 server.js "$PROVISION_DIR/server.js"
 run install -m 0644 nwc-connections.mjs "$PROVISION_DIR/nwc-connections.mjs"
@@ -121,6 +131,17 @@ run install -m 0644 monitor/check-phoenixd.service /etc/systemd/system/check-pho
 run install -m 0644 monitor/check-phoenixd.timer /etc/systemd/system/check-phoenixd.timer
 run systemctl daemon-reload
 run systemctl enable --now check-phoenixd.timer
+
+say "Backing up the wallet mapping"
+# Before the migration below touches it. This table is the only state here that
+# cannot be rebuilt, and until now only the code was backed up.
+PROVISION_DB="${PROVISION_DB_PATH:-$PROVISION_DIR/provisioning.sqlite3}"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would back up $PROVISION_DB into $PROVISION_DIR/backups"
+elif ! node scripts/backup-provision-db.mjs "$PROVISION_DB" "$PROVISION_DIR/backups"; then
+  echo "  ABORTING: could not back up the wallet mapping; $PM2_APP was NOT restarted" >&2
+  exit 1
+fi
 
 say "Migrating the pubkey to wallet mapping"
 # This MUST happen before the new code starts serving. The proxy resolves

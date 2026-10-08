@@ -1,0 +1,61 @@
+# A tag only becomes a release the box will deploy if the repository agrees with
+# itself about what that release is: tests green, version and changelog matching the
+# tag. The box polls for the published release, so this job is the gate in front of
+# production — nothing here can reach the host, and there are no deploy secrets.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # The same suite as on main. A tag is not exempt from it.
+      - run: npm test
+      - run: npm run test:cleanup
+      - run: npm run check
+
+      # Refuses a tag whose package.json or CHANGELOG disagrees with it.
+      - name: Check the release is coherent
+        run: node scripts/check-release.mjs "${GITHUB_REF_NAME}"
+
+      # The deployer refuses a tag outside the trusted history; fail here too, so the
+      # reason is visible in the release rather than only in the box's journal.
+      # The ref is fetched explicitly rather than assumed: a tag push does not
+      # necessarily leave a remote-tracking branch behind to compare against.
+      - name: Check the tag is on main
+        run: |
+          git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "${GITHUB_REF_NAME}^{commit}" origin/main \
+            || { echo "::error::${GITHUB_REF_NAME} is not an ancestor of origin/main"; exit 1; }
+
+      # Publishing is what the box watches for, so it happens last, only once
+      # everything above has passed. The notes come from the same tested code that
+      # validated the section, so they cannot drift from what was checked.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/check-release.mjs "${GITHUB_REF_NAME}" --notes > release-notes.md
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md
