@@ -73,13 +73,12 @@ done
 echo "  backup stamp: $STAMP"
 
 # Keep the recent ones only. Deploys used to be occasional and manual; on a timer
-# these accumulate until something fills the disk.
+# these accumulate until something fills the disk. In scripts/, with tests: the
+# first version of this was inline and killed the deploy whenever one of the globs
+# matched nothing.
 if [ "$DRY_RUN" -eq 0 ]; then
-  for d in "$PROVISION_DIR" "$MONITOR_DIR"; do
-    for base in server.js nwc-connections.mjs auth-v2.mjs monitor.mjs cleanup.py; do
-      ls -1t "$d/$base".bak-* 2>/dev/null | tail -n +11 | while read -r stale; do rm -f -- "$stale"; done
-    done
-  done
+  run ./scripts/prune-backups.sh "$PROVISION_DIR"
+  run ./scripts/prune-backups.sh "$MONITOR_DIR"
 fi
 
 say "Installing the proxy into $PROVISION_DIR"

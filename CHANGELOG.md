@@ -6,6 +6,20 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
+## 1.0.2 — 2026-10-08
+
+- Fix the backup pruning added in 1.0.0, which aborted every deploy. It ran
+  `ls <glob> | tail` inline under `set -euo pipefail`; a file with no backups yet
+  made the glob match nothing, `ls` exited non-zero and `pipefail` propagated it, so
+  the deploy stopped after taking its backups and before installing anything. The
+  mapping backup and the restart never ran. It is now `scripts/prune-backups.sh`,
+  with tests covering no backups, fewer than the limit, more than the limit, several
+  files pruned independently, a missing directory and a bad limit.
+- Group backups by file rather than pruning the directory as a whole, so a file with
+  two copies does not lose them because another file has twelve. Selection is by the
+  sortable stamp in the name, not mtime, and avoids bash 4 features so it behaves the
+  same on a developer's machine as on the host.
+
 ## 1.0.1 — 2026-10-08
 
 - Point `scripts/zaps-autodeploy.service` at `/srv/LNbits-proxy`, the checkout
