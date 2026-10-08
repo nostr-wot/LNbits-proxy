@@ -6,7 +6,12 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
-## Unreleased
+## 1.0.0 — 2026-10-08
+
+The first tagged release. The service has been running and deploying for some time;
+the sections below this one describe what shipped before releases were tagged, and
+this release carries all of it. From here a release is a tag, and the box deploys
+published releases by itself.
 
 ### Releases and deployment
 
