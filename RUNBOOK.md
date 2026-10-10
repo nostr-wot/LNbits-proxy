@@ -395,3 +395,18 @@ serve. Restoring only the old server leaves the new monitor reporting false fail
 The failed-deploy rollback commands printed by `deploy.sh` include the monitor restore.
 Cron loads the restored monitor on its next run; it needs no service restart. Never
 restart LNbits or phoenixd for a proxy-only change.
+
+## NWC requests accepted by the relay but never answered
+
+The LNbits NWC provider can log `Error parsing event: int() argument must be a string, a bytes-like object or a real number, not 'list'`. Affected versions pass the entire NIP-40 `expiration` tag to `int()` instead of its timestamp value, discarding valid requests before wallet dispatch. Clients without this tag may work while clients that set an expiry time out. Do not remove client expiry protection or retry payments automatically.
+
+The repository carries a narrow, idempotent maintenance repair. It recognizes the exact defective source, saves the original beside it as `nwcp.py.before-expiration-fix`, and changes only extraction of the timestamp. Malformed timestamps are still rejected and expired requests are still dropped. Unknown upstream source aborts for review.
+
+```bash
+./deploy.sh --repair-nwc-expiration --dry-run
+./deploy.sh --repair-nwc-expiration
+```
+
+Set `NWC_PROVIDER_FILE` if the installed provider lives outside the reference path. This explicit mode restarts LNbits only when the file changes; it does not deploy the proxy or restart phoenixd. A failed immediate restart restores the backup. Verify `/healthz`, inspect the NWC listener logs, and send a disposable-key `get_info` request with an expiration tag: the expected response is `UNAUTHORIZED`, demonstrating parsing and response routing without a payment. A provider upgrade may replace the patched file; inspect the new parser rather than blindly reapplying it.
+
+A separate HTTP 429 from the wallet proxy means its 120-request-per-minute per-IP wallet budget was reached. Balance and transaction refreshes share this budget with payment requests. Inspect aggregated access counts and stop excessive polling; do not raise limits to conceal a client refresh loop.

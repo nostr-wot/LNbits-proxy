@@ -19,11 +19,13 @@ PM2_APP="${PM2_APP:-zaps-provision}"
 BASE_URL="${DEPLOY_SMOKE_URL:-https://zaps.nostr-wot.com}"
 REF="origin/main"
 DRY_RUN=0
+REPAIR_NWC=0
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --repair-nwc-expiration) REPAIR_NWC=1; shift ;;
     --ref) REF="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -44,6 +46,28 @@ git fetch --quiet origin
 git rev-parse --verify --quiet "$REF" >/dev/null || { echo "  no such ref: $REF" >&2; exit 1; }
 echo "  deploying $REF ($(git rev-parse --short "$REF"))"
 run git checkout --quiet --detach "$REF"
+
+# Explicit maintenance mode: this is a provider repair, not a proxy-only deploy.
+# Never touch phoenixd or install unrelated proxy changes in this mode.
+if [ "$REPAIR_NWC" -eq 1 ]; then
+  NWC_PROVIDER_FILE="${NWC_PROVIDER_FILE:-/home/lnbits/lnbits/lnbits/extensions/nwcprovider/nwcp.py}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    python3 scripts/repair-nwc-expiration.py "$NWC_PROVIDER_FILE" --dry-run
+    exit 0
+  fi
+  repair_result="$(python3 scripts/repair-nwc-expiration.py "$NWC_PROVIDER_FILE")"
+  echo "  NWC expiration parser: $repair_result"
+  if [ "$repair_result" = changed ]; then
+    if ! systemctl restart lnbits || ! systemctl is-active --quiet lnbits; then
+      echo "  Restart failed; restoring the original provider source"
+      cp -p "$NWC_PROVIDER_FILE.before-expiration-fix" "$NWC_PROVIDER_FILE"
+      systemctl restart lnbits
+      exit 1
+    fi
+  fi
+  systemctl is-active --quiet lnbits
+  exit 0
+fi
 
 say "Installing dependencies and running checks"
 run npm ci --omit=dev --silent
