@@ -370,4 +370,4 @@ See [`RUNBOOK.md`](RUNBOOK.md).
 
 ## Licence
 
-MIT. See [`LICENSE`](LICENSE).
+GNU General Public License, version 3 only ([GPL-3.0-only](LICENSE)). See [NOTICE.md](NOTICE.md) for preserved notices.
