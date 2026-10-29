@@ -6,6 +6,11 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
+## Unreleased
+
+- Add operator-reserved Lightning Address aliases tied to verified proxy wallet ownership. Reservations survive release and account deletion, preventing other pubkeys from reusing protected names.
+- Return Lightning Addresses on a configurable display domain, defaulting to nostrwot.com for the hosted service while preserving the API origin and LNURL callbacks.
+
 ## 1.0.2 — 2026-10-08
 
 - Fix the backup pruning added in 1.0.0, which aborted every deploy. It ran

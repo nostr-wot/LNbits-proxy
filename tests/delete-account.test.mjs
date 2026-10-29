@@ -279,11 +279,16 @@ test('a zero-balance account is deleted completely, and a repeat finds nothing',
   const s = await setup(t);
   const { alice, bob } = s.people;
   assert.equal(await s.lightningAddress(alice), 'alice@wallet.test');
+  const aliases = new DatabaseSync(s.provisionPath);
+  aliases.prepare('INSERT INTO lightning_aliases VALUES (?, ?)').run('alice-reserved', alice.pubkey);
+  t.after(() => aliases.close());
 
   const res = await s.del(alice);
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { deleted: true });
   assert.deepEqual(s.artefacts(alice), gone);
+  assert.equal(aliases.prepare('SELECT pubkey FROM lightning_aliases WHERE username=?').get('alice-reserved').pubkey, alice.pubkey);
+  assert.equal((await fetch(`http://127.0.0.1:${s.port}/.well-known/lnurlp/alice-reserved`)).status, 404);
   assert.equal(await s.lightningAddress(alice), null);
   assert.equal(s.deletions().length, 1);
   assert.equal(s.deletions()[0].forfeited_msat, 0);

@@ -55,6 +55,10 @@ const nwcRoutes = createNwcRoutes({backend:LNBITS_URL,dbPath:LNBITS_DB_PATH});
 const PORT = parseInt(process.env.PORT || '3003', 10);
 const BASE_URL = publicOrigin(process.env.PUBLIC_ORIGIN || 'https://zaps.nostr-wot.com');
 const DOMAIN = new URL(BASE_URL).host;
+const ADDRESS_DOMAIN = process.env.LIGHTNING_ADDRESS_DOMAIN || (DOMAIN === 'zaps.nostr-wot.com' ? 'nostrwot.com' : DOMAIN);
+if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]+)?$/.test(ADDRESS_DOMAIN)) {
+  throw new Error('LIGHTNING_ADDRESS_DOMAIN must be a lowercase hostname, optionally with a port');
+}
 const BROWSER_ORIGINS = allowedOrigins(process.env.BROWSER_ORIGINS);
 const auth = createAuth({dbPath: PROVISION_DB_PATH, publicOrigin: BASE_URL});
 const MAX_BODY_BYTES = 65_536;   // 64KB body limit
@@ -97,6 +101,10 @@ function openProvisionDb() {
         user_id    TEXT NOT NULL,
         wallet_id  TEXT NOT NULL,
         created_at REAL NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS lightning_aliases (
+        username TEXT PRIMARY KEY,
+        pubkey TEXT NOT NULL
       );
       -- One row per completed account deletion. Deliberately carries no pubkey,
       -- user or wallet id: only when it happened and what balance was forfeited.
@@ -903,8 +911,15 @@ const server = createServer(async (req, res) => {
 
       // Opened inside the try: if this throws, the finally below still releases
       // the mutex. Opening it before the try leaked the username permanently.
-      let lnurlpDb;
+      let lnurlpDb, reservationDb;
       try {
+        // Serialize claims with operator reservations across proxy processes.
+        reservationDb = openProvisionDb();
+        reservationDb.exec('BEGIN IMMEDIATE');
+        const reserved = reservationDb.prepare('SELECT pubkey FROM lightning_aliases WHERE username = ?').get(sanitizedUsername);
+        if (reserved && reserved.pubkey !== verified.pubkey) {
+          return jsonResponse(res, 409, { error: 'This username is reserved' });
+        }
         lnurlpDb = openDb(LNURLP_DB_PATH);
         // Check if username is already taken
         const existing = lnurlpDb.prepare('SELECT id FROM pay_links WHERE username = ?').get(sanitizedUsername);
@@ -915,7 +930,7 @@ const server = createServer(async (req, res) => {
         // Check if this wallet already has a pay link
         const walletLink = lnurlpDb.prepare('SELECT id, username FROM pay_links WHERE wallet = ?').get(wallet.id);
         if (walletLink) {
-          return jsonResponse(res, 409, { error: `You already have a Lightning Address: ${walletLink.username}@${DOMAIN}` });
+          return jsonResponse(res, 409, { error: `You already have a Lightning Address: ${walletLink.username}@${ADDRESS_DOMAIN}` });
         }
 
         // Create pay link
@@ -947,12 +962,13 @@ const server = createServer(async (req, res) => {
           throw e;
         }
 
-        return jsonResponse(res, 200, { address: `${sanitizedUsername}@${DOMAIN}`, payLinkId });
+        return jsonResponse(res, 200, { address: `${sanitizedUsername}@${ADDRESS_DOMAIN}`, payLinkId });
       } catch (e) {
         console.error(`[claim-username] error:`, e.message);
         return jsonResponse(res, 500, { error: 'Failed to create Lightning Address' });
       } finally {
         lnurlpDb?.close();
+        reservationDb?.close(); // Closing rolls back the read-only reservation transaction.
         _claimingUsernames.delete(sanitizedUsername);
       }
     }
@@ -973,7 +989,7 @@ const server = createServer(async (req, res) => {
       try {
         const link = lnurlpDb.prepare('SELECT username FROM pay_links WHERE wallet = ?').get(wallet.id);
         if (link && link.username) {
-          return jsonResponse(res, 200, { address: `${link.username}@${DOMAIN}` });
+          return jsonResponse(res, 200, { address: `${link.username}@${ADDRESS_DOMAIN}` });
         }
         return jsonResponse(res, 200, { address: null });
       } catch (e) {
@@ -1057,6 +1073,31 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && PROXY_ALLOWLIST.some(re => re.test(parsedUrl.pathname))) {
       if (!checkRateLimit(clientIp, 'lnurl')) {
         return jsonResponse(res, 429, { error: 'Too many requests' });
+      }
+      if (parsedUrl.pathname.startsWith('/.well-known/lnurlp/')) {
+        const username = parsedUrl.pathname.split('/').at(-1);
+        const pdb = openProvisionDb();
+        let alias;
+        try { alias = pdb.prepare('SELECT pubkey FROM lightning_aliases WHERE username = ?').get(username); }
+        finally { pdb.close(); }
+        if (alias) {
+          const wallet = findWalletByPubkey(alias.pubkey);
+          if (!wallet) return jsonResponse(res, 404, { status: 'ERROR', reason: 'Lightning Address unavailable' });
+          const links = openDb(LNURLP_DB_PATH, { readOnly: true });
+          let target;
+          try {
+            const owned = links.prepare('SELECT id, username FROM pay_links WHERE wallet = ?').all(wallet.id);
+            // Ambiguous or missing links fail closed. Never follow an unowned username.
+            if (owned.length === 1 && USERNAME_RE.test(owned[0].username)) {
+              const matches = links.prepare('SELECT wallet FROM pay_links WHERE username = ?').all(owned[0].username);
+              if (matches.length === 1 && matches[0].wallet === wallet.id && /^[a-zA-Z0-9]+$/.test(owned[0].id)) target = owned[0].id;
+            }
+          } finally { links.close(); }
+          if (!target) return jsonResponse(res, 404, { status: 'ERROR', reason: 'Lightning Address unavailable' });
+          // Bind the upstream request to the checked link ID: a released username
+          // may be claimed by another wallet before LNbits handles this request.
+          parsedUrl.pathname = '/lnurlp/api/v1/lnurl/' + target;
+        }
       }
       // Use parsedUrl.pathname (normalized) instead of raw req.url
       let proxyPath = parsedUrl.pathname + parsedUrl.search;

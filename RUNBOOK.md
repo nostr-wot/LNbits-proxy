@@ -410,3 +410,17 @@ The repository carries a narrow, idempotent maintenance repair. It recognizes th
 Set `NWC_PROVIDER_FILE` if the installed provider lives outside the reference path. This explicit mode restarts LNbits only when the file changes; it does not deploy the proxy or restart phoenixd. A failed immediate restart restores the backup. Verify `/healthz`, inspect the NWC listener logs, and send a disposable-key `get_info` request with an expiration tag: the expected response is `UNAUTHORIZED`, demonstrating parsing and response routing without a payment. A provider upgrade may replace the patched file; inspect the new parser rather than blindly reapplying it.
 
 A separate HTTP 429 from the wallet proxy means its 120-request-per-minute per-IP wallet budget was reached. Balance and transaction refreshes share this budget with payment requests. Inspect aggregated access counts and stop excessive polling; do not raise limits to conceal a client refresh loop.
+
+## Reserving Lightning Address aliases
+
+First verify the requested owner's pubkey from the proxy's `provisioned` table and confirm its active wallet and current `pay_links` row. Never use LNbits `accounts.pubkey` as ownership evidence. Back up `PROVISION_DB_PATH` with `scripts/backup-provision-db.mjs` before changing reservations. From the deployed repository checkout, with the service database environment loaded, run:
+
+```bash
+node scripts/reserve-lightning-aliases.mjs --pubkey <verified-owner-pubkey> <name> <another-name>
+```
+
+The command requires an existing provisioned active wallet with one named pay link, validates all names, and commits the reservation batch atomically. Repeating the same reservation is safe. It refuses a name reserved to another pubkey. It also refuses any name currently pointing to another wallet's pay link: inspect that account and obtain explicit approval to redirect that name before adding `--allow-existing-name`. This override reserves and redirects the public name but does not change or delete the other wallet or its pay link. Existing callback URLs and already-issued invoices continue to belong to their original wallet.
+
+Reservations are kept after release and account deletion; they retain the username and public owner pubkey for takeover prevention. They stop resolving when the owner has no active wallet/pay link and resume if that pubkey provisions a wallet and claims a name again. A normal user cannot remove or transfer a reservation. Changing one requires a separately reviewed operator database operation. Do not restore an old provisioning backup without preserving newer reservations, or names can become claimable again.
+
+Verify each alias with `GET /.well-known/lnurlp/<name>`, then compare the callback with the owner's current address. Set `LIGHTNING_ADDRESS_DOMAIN` only after the display domain serves this path through the same proxy. `PUBLIC_ORIGIN`, upstream Host rewriting and stored pay-link domains continue to use the API hostname for signed requests and callbacks.

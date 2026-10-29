@@ -66,17 +66,7 @@ event's pubkey is the only identity used, so a signer can only ever reach their 
 | 502 | `{"error":"upstream_unavailable"}` | LNbits or the NWC provider failed; safe to retry with a fresh challenge |
 | 500 | `{"error":"deletion_failed"}` | A database step failed; safe to retry with a fresh challenge |
 
-A deletion revokes every NWC grant the wallet holds (expired ones included),
-releases the Lightning Address, deletes the LNbits wallet, its account and the rows
-LNbits keys by them, then removes the proxy's pubkey mapping. With
-`acknowledgeBalance: true` any remaining balance is forfeited and stays with the
-operator's node. The balance is checked again after the address is released, so a zap
-that lands mid-deletion is counted. Each step is idempotent and the mapping is
-removed last, so a call that fails part-way is completed by the next one. Clients
-should treat 404 after a 200, or after a failed attempt they retried, as "already
-deleted". The proxy keeps only an anonymous record: a timestamp and the forfeited
-msat, with no pubkey, user or wallet id. See [RUNBOOK.md](RUNBOOK.md#account-deletion)
-for what LNbits retains.
+A deletion revokes every NWC grant the wallet holds (expired ones included), releases the Lightning Address, deletes the LNbits wallet, its account and the rows LNbits keys by them, then removes the proxy's pubkey mapping. With `acknowledgeBalance: true` any remaining balance is forfeited and stays with the operator's node. The balance is checked again after the address is released, so a zap that lands mid-deletion is counted. Each step is idempotent and the mapping is removed last, so a call that fails part-way is completed by the next one. Clients should treat 404 after a 200, or after a failed attempt they retried, as "already deleted". The deletion audit keeps an anonymous record: a timestamp and the forfeited msat, with no pubkey, user or wallet id. Operator-created alias reservations retain their username and owner pubkey after deletion to prevent reassignment; they no longer resolve while the owner has no active wallet and pay link. See [RUNBOOK.md](RUNBOOK.md#account-deletion) for what LNbits retains.
 
 ### NWC app connections
 
@@ -101,7 +91,7 @@ generated in the client and never sent here.
 
 ### Proxied LNbits paths
 
-Forwarded verbatim; nothing else is.
+Forwarded through the allowlist; nothing else is. Operator-reserved Lightning Address aliases resolve through their owner’s current wallet pay link before forwarding.
 
 ```
 GET       /.well-known/lnurlp/{username}      public, permissive CORS
@@ -204,6 +194,7 @@ Copy `.env.example`. Only `LNBITS_ADMIN_KEY` is required.
 | `LNURLP_DB_PATH` | `/home/lnbits/lnbits/data/ext_lnurlp.sqlite3` | lnurlp extension database |
 | `PROVISION_DB_PATH` | `/srv/zaps-provision/provisioning.sqlite3` | Proxy-owned pubkey to wallet mapping |
 | `PUBLIC_ORIGIN` | `https://zaps.nostr-wot.com` | Exact HTTPS audience origin, no trailing slash |
+| `LIGHTNING_ADDRESS_DOMAIN` | `PUBLIC_ORIGIN` host; `nostrwot.com` for `zaps.nostr-wot.com` | Domain returned in Lightning Addresses; configure LNURL forwarding on this domain separately |
 | `BROWSER_ORIGINS` | *(empty)* | Comma-separated exact HTTPS browser origins |
 | `PORT` | `3003` | Loopback listen port |
 
@@ -232,6 +223,12 @@ node scripts/backfill-provisioned.mjs
 It is idempotent and verifies that every pubkey resolves to the same wallet and keys as
 before, exiting non-zero otherwise. `deploy.sh` runs it before restarting and aborts the
 deploy if verification fails.
+
+## Owned Lightning Address aliases
+
+Operators can reserve several names for one verified Nostr pubkey with `scripts/reserve-lightning-aliases.mjs`; see the runbook. Reservations live in `PROVISION_DB_PATH.lightning_aliases`, survive username release and account deletion, and block every other pubkey from claiming those names. The owner may reclaim a reserved name after releasing their current address. Ordinary unreserved usernames retain their existing release behavior.
+
+An alias resolves through the proxy-owned `provisioned` mapping to the owner's active wallet and its current named pay link. Missing, deleted or ambiguous wallets/pay links fail closed, even if another LNbits account has the same pubkey or an old alias name. LNURL callbacks and NIP-57 request handling retain the API origin. The returned display address uses `LIGHTNING_ADDRESS_DOMAIN`; self-hosted instances default to their API hostname. A separate display domain must forward `/.well-known/lnurlp/` to this proxy.
 
 ## Running
 
