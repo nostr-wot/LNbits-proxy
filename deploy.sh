@@ -74,11 +74,12 @@ run npm ci --omit=dev --silent
 run node --check server.js
 run node --check nwc-connections.mjs
 run node --check auth-v2.mjs
+run node --check terminal-nfc.mjs
 run node --check monitor/monitor.mjs
 # Tests need dev deps; skip them here and rely on CI plus a pre-deploy `npm test`.
 
 say "Comparing against what is live"
-for f in server.js nwc-connections.mjs auth-v2.mjs; do
+for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs; do
   if [ ! -f "$PROVISION_DIR/$f" ]; then
     echo "  $f is not installed yet and will be created"
   elif diff -q "$f" "$PROVISION_DIR/$f" >/dev/null; then
@@ -89,7 +90,7 @@ for f in server.js nwc-connections.mjs auth-v2.mjs; do
 done
 
 say "Backing up the live files"
-for f in server.js nwc-connections.mjs auth-v2.mjs; do
+for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs; do
   [ -f "$PROVISION_DIR/$f" ] && run cp -a "$PROVISION_DIR/$f" "$PROVISION_DIR/$f.bak-$STAMP"
 done
 [ -f "$MONITOR_DIR/monitor.mjs" ] && run cp -a "$MONITOR_DIR/monitor.mjs" "$MONITOR_DIR/monitor.mjs.bak-$STAMP"
@@ -109,6 +110,7 @@ say "Installing the proxy into $PROVISION_DIR"
 run install -m 0644 server.js "$PROVISION_DIR/server.js"
 run install -m 0644 nwc-connections.mjs "$PROVISION_DIR/nwc-connections.mjs"
 run install -m 0644 auth-v2.mjs "$PROVISION_DIR/auth-v2.mjs"
+run install -m 0644 terminal-nfc.mjs "$PROVISION_DIR/terminal-nfc.mjs"
 run install -m 0644 package.json "$PROVISION_DIR/package.json"
 run install -m 0644 package-lock.json "$PROVISION_DIR/package-lock.json"
 # The target has its own node_modules; refresh it so it matches the lockfile.
@@ -246,6 +248,7 @@ if [ "$fail" -ne 0 ]; then
 Deploy verification FAILED. To roll back:
   cp -a $PROVISION_DIR/server.js.bak-$STAMP $PROVISION_DIR/server.js
   cp -a $PROVISION_DIR/nwc-connections.mjs.bak-$STAMP $PROVISION_DIR/nwc-connections.mjs
+  [ ! -f $PROVISION_DIR/terminal-nfc.mjs.bak-$STAMP ] || cp -a $PROVISION_DIR/terminal-nfc.mjs.bak-$STAMP $PROVISION_DIR/terminal-nfc.mjs
   [ ! -f $PROVISION_DIR/auth-v2.mjs.bak-$STAMP ] || cp -a $PROVISION_DIR/auth-v2.mjs.bak-$STAMP $PROVISION_DIR/auth-v2.mjs
   [ ! -f $MONITOR_DIR/monitor.mjs.bak-$STAMP ] || cp -a $MONITOR_DIR/monitor.mjs.bak-$STAMP $MONITOR_DIR/monitor.mjs
   pm2 restart $PM2_APP --update-env

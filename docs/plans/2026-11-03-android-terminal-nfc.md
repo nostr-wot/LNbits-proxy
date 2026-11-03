@@ -1,0 +1,7 @@
+# Android terminal payment
+
+The user approved adding Android phone-as-card payments for LNURL-withdraw terminals. A foreground Android HCE tag exposes a single-use, 60-second withdrawal URL from the existing proxy. The user enters a maximum invoice amount, taps a terminal, and approves the received invoice using the existing Send review and fee handling. No automatic payment, wallet credentials, or private keys go to the mailbox server. Terminal compatibility must be physically tested; this is standard LNURL-withdraw over Type 4 NDEF, not NTAG424 hardware authentication emulation.
+
+The proxy holds bounded ephemeral sessions with independent random public and owner capabilities. Public discovery returns LNURL-withdraw metadata; the callback can submit one immutable invoice. Owner polling returns it to the app. Cancellation, expiry, restart, and single-use prevent reuse. The app validates BOLT11, expiry and amount against its local cap before opening review. All HTTP uses the central kill-switch gate; native exposure stops on navigation, account change, background or lock.
+
+Implementation order: mailbox and adversarial tests; native restricted withdrawal URI sharing; client session and lifecycle; reuse scanner entry and Send review; localized labels; lint, typecheck, focused payment tests and native build. Deploy the proxy through its existing deployment script; hardware-signing remains a local user step before installing a release.
