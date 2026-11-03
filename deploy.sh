@@ -213,7 +213,10 @@ fi
 
 say "Restarting $PM2_APP only"
 # Deliberately not LNbits or phoenixd: a proxy change never needs those bounced.
-run pm2 restart "$PM2_APP" --update-env
+if ! run pm2 restart "$PM2_APP" --update-env; then
+  restore_proxy
+  exit 1
+fi
 run sleep 4
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -226,7 +229,7 @@ fail=0
 check() {
   local label="$1" expected="$2"; shift 2
   local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$@")"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$@")" || code=000
   if [ "$code" = "$expected" ]; then
     printf '  ok    %-34s HTTP %s\n' "$label" "$code"
   else
