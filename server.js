@@ -34,6 +34,7 @@
  *   PORT             - Listen port (default: 3003)
  */
 
+import { createTerminalMailbox, terminalHandler } from './terminal-nfc.mjs';
 import { createServer, request as httpRequest } from 'node:http';
 import { createNwcRoutes } from './nwc-connections.mjs';
 import { existsSync } from 'node:fs';
@@ -167,6 +168,8 @@ const WALLET_API_ALLOWLIST = [
 // ── Per-IP rate limiting ──
 
 const rateLimitBuckets = {
+  terminalCreate: { maxPerMin: 10, entries: new Map() },
+  terminal: { maxPerMin: 180, entries: new Map() },
   nwc:        { maxPerMin: 60, entries: new Map() },
   challenge:  { maxPerMin: 10, entries: new Map() },
   provision:  { maxPerMin: 5,  entries: new Map() },
@@ -758,12 +761,15 @@ async function deleteAccount(pubkey, acknowledgeBalance) {
 
 // ── Request handler ──
 
+const handleTerminal = terminalHandler({ mailbox: createTerminalMailbox({ origin: BASE_URL }), readBody, allow: checkRateLimit });
+
 const server = createServer(async (req, res) => {
   try {
     const clientIp = getClientIp(req);
 
     // Use a configured audience, never Host or forwarded host headers.
     const parsedUrl = new URL(req.url, BASE_URL);
+    if (await handleTerminal(req, res, parsedUrl, clientIp)) return;
     const legacyPaths = ['/api/provision/challenge','/api/provision','/api/claim-username','/api/release-username'];
     if (legacyPaths.includes(parsedUrl.pathname)) {
       return jsonResponse(res, 426, {error:'Upgrade required: use the body-bound v2 authentication flow', version:2});
