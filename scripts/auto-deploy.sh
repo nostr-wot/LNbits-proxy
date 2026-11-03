@@ -99,8 +99,8 @@ fi
 
 note "deploying $tag"
 if ! "$DEPLOY_CMD" --ref "$tag"; then
-  # Deliberately not recorded: deploy.sh leaves the previous version serving when it
-  # aborts, and the next tick should try again rather than assume this one is live.
+  # Deliberately not recorded: deploy.sh restores the prior proxy if verification
+  # fails. A subsequent tick may retry, but must not assume this version is live.
   fail "deploying $tag failed; $(basename "$DEPLOY_CMD") reports the detail above"
 fi
 

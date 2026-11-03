@@ -424,3 +424,9 @@ The command requires an existing provisioned active wallet with one named pay li
 Reservations are kept after release and account deletion; they retain the username and public owner pubkey for takeover prevention. They stop resolving when the owner has no active wallet/pay link and resume if that pubkey provisions a wallet and claims a name again. A normal user cannot remove or transfer a reservation. Changing one requires a separately reviewed operator database operation. Do not restore an old provisioning backup without preserving newer reservations, or names can become claimable again.
 
 Verify each alias with `GET /.well-known/lnurlp/<name>`, then compare the callback with the owner's current address. Set `LIGHTNING_ADDRESS_DOMAIN` only after the display domain serves this path through the same proxy. `PUBLIC_ORIGIN`, upstream Host rewriting and stored pay-link domains continue to use the API hostname for signed requests and callbacks.
+
+## Missing module after release checkout
+
+On 2026-11-03, an already-running installer checked out a new release but continued its previous file-install list. The new server imported a module that was not copied to runtime, causing proxy HTTP 502 responses. LNbits and the Lightning node remained running. Restoring the prior proxy files recovered access; rerunning the selected release’s installer installed the missing module.
+
+The installer now re-executes after a revision change, checks local imports before restart, and automatically restores backed-up proxy files when verification fails. For the first upgrade from an older installer without this safeguard, check out the reviewed release before launching deploy.sh. Never restart LNbits or phoenixd to repair a proxy module error. A PM2 online label alone does not establish health; verify the HTTP health endpoint and authenticated route guards.

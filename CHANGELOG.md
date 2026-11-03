@@ -6,6 +6,10 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
+## 1.0.4 — 2026-11-03
+
+- Run the selected release’s installer after checkout, verify local runtime imports before restart, and restore the previous proxy files if post-deployment checks fail. This prevents new modules being omitted by an older running installer.
+
 ## 1.0.3 — 2026-11-03
 
 - Add a short-lived, single-invoice LNURL-withdraw mailbox for Android terminal payments. Payment credentials stay on the phone and each invoice requires approval there.
