@@ -17,6 +17,7 @@ PROVISION_DIR="${PROVISION_DIR:-/srv/zaps-provision}"
 MONITOR_DIR="${MONITOR_DIR:-/srv/zaps-monitor}"
 PM2_APP="${PM2_APP:-zaps-provision}"
 BASE_URL="${DEPLOY_SMOKE_URL:-https://zaps.nostr-wot.com}"
+ORIGINAL_ARGS=("$@")
 REF="origin/main"
 DRY_RUN=0
 REPAIR_NWC=0
@@ -35,6 +36,7 @@ say() { printf '\n== %s\n' "$*"; }
 run() { if [ "$DRY_RUN" -eq 1 ]; then echo "  would run: $*"; else "$@"; fi; }
 
 cd "$(dirname "$0")"
+SCRIPT_REV="$(git rev-parse HEAD)"
 
 say "Checking the working tree"
 if [ -n "$(git status --porcelain)" ]; then
@@ -46,6 +48,11 @@ git fetch --quiet origin
 git rev-parse --verify --quiet "$REF" >/dev/null || { echo "  no such ref: $REF" >&2; exit 1; }
 echo "  deploying $REF ($(git rev-parse --short "$REF"))"
 run git checkout --quiet --detach "$REF"
+# A running shell retains the old script after checkout replaces its inode.
+# Re-enter the installer from the selected revision before installing anything.
+if [ "$DRY_RUN" -eq 0 ] && [ "$SCRIPT_REV" != "$(git rev-parse HEAD)" ]; then
+  exec bash ./deploy.sh "${ORIGINAL_ARGS[@]}"
+fi
 
 # Explicit maintenance mode: this is a provider repair, not a proxy-only deploy.
 # Never touch phoenixd or install unrelated proxy changes in this mode.
@@ -188,9 +195,28 @@ if [ -f scripts/backfill-provisioned.mjs ]; then
   fi
 fi
 
+restore_proxy() {
+  echo "Restoring the previous proxy files" >&2
+  for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs; do
+    if [ -f "$PROVISION_DIR/$f.bak-$STAMP" ]; then
+      cp -a "$PROVISION_DIR/$f.bak-$STAMP" "$PROVISION_DIR/$f" || return 1
+    fi
+  done
+  pm2 restart "$PM2_APP" --update-env
+}
+
+# --check only parses server.js; it cannot catch missing imported modules.
+if [ "$DRY_RUN" -eq 0 ] && ! node scripts/check-installed-modules.mjs "$PROVISION_DIR/server.js"; then
+  restore_proxy
+  exit 1
+fi
+
 say "Restarting $PM2_APP only"
 # Deliberately not LNbits or phoenixd: a proxy change never needs those bounced.
-run pm2 restart "$PM2_APP" --update-env
+if ! run pm2 restart "$PM2_APP" --update-env; then
+  restore_proxy
+  exit 1
+fi
 run sleep 4
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -203,7 +229,7 @@ fail=0
 check() {
   local label="$1" expected="$2"; shift 2
   local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$@")"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$@")" || code=000
   if [ "$code" = "$expected" ]; then
     printf '  ok    %-34s HTTP %s\n' "$label" "$code"
   else
@@ -243,16 +269,8 @@ if ! pm2 describe "$PM2_APP" | grep -q "online"; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-  cat >&2 <<EOF
-
-Deploy verification FAILED. To roll back:
-  cp -a $PROVISION_DIR/server.js.bak-$STAMP $PROVISION_DIR/server.js
-  cp -a $PROVISION_DIR/nwc-connections.mjs.bak-$STAMP $PROVISION_DIR/nwc-connections.mjs
-  [ ! -f $PROVISION_DIR/terminal-nfc.mjs.bak-$STAMP ] || cp -a $PROVISION_DIR/terminal-nfc.mjs.bak-$STAMP $PROVISION_DIR/terminal-nfc.mjs
-  [ ! -f $PROVISION_DIR/auth-v2.mjs.bak-$STAMP ] || cp -a $PROVISION_DIR/auth-v2.mjs.bak-$STAMP $PROVISION_DIR/auth-v2.mjs
-  [ ! -f $MONITOR_DIR/monitor.mjs.bak-$STAMP ] || cp -a $MONITOR_DIR/monitor.mjs.bak-$STAMP $MONITOR_DIR/monitor.mjs
-  pm2 restart $PM2_APP --update-env
-EOF
+  echo "Deploy verification failed; rolling the proxy back automatically" >&2
+  restore_proxy || echo "URGENT: automatic proxy rollback failed" >&2
   exit 1
 fi
 
