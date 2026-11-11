@@ -40,7 +40,7 @@ export function createAuth({dbPath, publicOrigin: origin, maxRows = 10_000, now 
   return {
     issue(body, scope) {
       requireValid(body && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).sort().join(',') === 'method,payload,url');
-      requireValid(urls.has(body.url) && body.method === 'POST' && HEX.test(body.payload));
+      requireValid(urls.has(body.url) && body.method === 'POST' && typeof body.payload==='string' && HEX.test(body.payload));
       const challenge=randomBytes(32).toString('hex');
       const transactionToken=randomBytes(32).toString('hex');
       const expiresAt=now()+60;

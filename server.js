@@ -27,7 +27,7 @@
  *
  * Environment variables:
  *   LNBITS_URL       - LNbits backend URL (default: http://127.0.0.1:5000)
- *   LNBITS_ADMIN_KEY - LNbits super-user API key for wallet creation
+ *   LNBITS_PROVISION_TOKEN_FILE - private file containing the user-management API token
  *   LNBITS_DB_PATH   - Path to LNbits SQLite database
  *   LNURLP_DB_PATH   - Path to LNbits lnurlp extension database
  *   PROVISION_DB_PATH - Proxy-owned pubkey to wallet mapping (not LNbits')
@@ -37,13 +37,17 @@
 import { createTerminalMailbox, terminalHandler } from './terminal-nfc.mjs';
 import { createServer, request as httpRequest } from 'node:http';
 import { createNwcRoutes } from './nwc-connections.mjs';
-import { existsSync } from 'node:fs';
+import { InvalidInput, walletBody, upstreamPath } from './request-policy.mjs';
+import { existsSync, readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createAuth, publicOrigin, allowedOrigins, clientScope, AUTH_PATHS, CHALLENGE_PATH } from './auth-v2.mjs';
 
 const LNBITS_URL = process.env.LNBITS_URL || 'http://127.0.0.1:5000';
-const LNBITS_ADMIN_KEY = process.env.LNBITS_ADMIN_KEY;
+const tokenFile = process.env.LNBITS_PROVISION_TOKEN_FILE || '/etc/zaps-provision/user-create.token';
+const provisionToken = process.env.LNBITS_PROVISION_TOKEN || (existsSync(tokenFile) ? readFileSync(tokenFile,'utf8').trim() : '');
+const backend = new URL(LNBITS_URL);
+if (backend.protocol !== 'http:' || backend.hostname !== '127.0.0.1' || backend.origin !== LNBITS_URL) throw new Error('Expected an exact loopback LNbits origin');
 const LNBITS_DB_PATH = process.env.LNBITS_DB_PATH || '/home/lnbits/lnbits/data/database.sqlite3';
 const LNURLP_DB_PATH = process.env.LNURLP_DB_PATH || '/home/lnbits/lnbits/data/ext_lnurlp.sqlite3';
 // Proxy-owned mapping of Nostr pubkey to wallet. Deliberately NOT inside the
@@ -156,7 +160,7 @@ const PROXY_ALLOWLIST = [
 // Matched against the normalized pathname only; `methods` is exhaustive, so a
 // path is reachable by the verbs listed for it and by nothing else.
 const WALLET_API_ALLOWLIST = [
-  { methods: ['GET', 'POST'], pathname: /^\/api\/v1\/wallet$/ },
+  { methods: ['GET'], pathname: /^\/api\/v1\/wallet$/ },
   { methods: ['GET', 'POST'], pathname: /^\/api\/v1\/payments$/ },
   // GET /api/v1/payments/fee-reserve?invoice=<bolt11> returns the fee_limit_msat
   // LNbits hands the funding source, so the extension can compare a sweep's
@@ -290,8 +294,8 @@ function proxyToLnbits(clientReq, clientRes, proxiedPath) {
     path: proxiedPath,
     method: 'GET',
     headers: {
-      'accept': clientReq.headers['accept'] || '*/*',
-      'accept-encoding': clientReq.headers['accept-encoding'] || '',
+      'accept':'application/json',
+      'accept-encoding':'identity',
       'host': DOMAIN,
       'x-forwarded-proto': 'https',
       'x-forwarded-host': DOMAIN,
@@ -302,7 +306,7 @@ function proxyToLnbits(clientReq, clientRes, proxiedPath) {
   console.log(`[proxy] GET ${new URL(proxiedPath, 'http://x').pathname}`);
 
   const proxy = httpRequest(opts, (proxyRes) => {
-    const headers = { ...proxyRes.headers, ...LNURL_CORS_HEADERS };
+    const headers = { 'Content-Type':'application/json', 'Cache-Control':'no-store', ...LNURL_CORS_HEADERS };
     clientRes.writeHead(proxyRes.statusCode, headers);
     // If LNbits dies mid-body the reset lands here, not on the request object.
     // Without this the client waits out its own timeout on a response that
@@ -371,7 +375,7 @@ function proxyWalletApi(clientReq, clientRes, proxiedPath, body) {
   console.log(`[wallet-proxy] ${clientReq.method} ${new URL(proxiedPath, 'http://x').pathname}`);
 
   const proxy = httpRequest(opts, (proxyRes) => {
-    clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+    clientRes.writeHead(proxyRes.statusCode, {'Content-Type':'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});
     const abandon = (err) => {
       console.error('[wallet-proxy] LNbits aborted mid-response:', err?.message || 'aborted');
       clientRes.destroy();
@@ -451,21 +455,21 @@ function findWalletByPubkey(pubkey) {
  * Create a wallet via LNbits admin API.
  */
 async function createLnbitsWallet(walletName) {
-  const res = await fetch(`${LNBITS_URL}/api/v1/account`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Api-Key': LNBITS_ADMIN_KEY,
-    },
-    body: JSON.stringify({ name: walletName }),
+  const res = await fetch(LNBITS_URL + '/users/api/v1/user', {
+    method:'POST', redirect:'error', signal:AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    headers:{'Content-Type':'application/json',Authorization:'Bearer '+provisionToken},
+    body:'{}',
   });
-  if (!res.ok) {
-    const text = await res.text();
-    console.error(`[provision] LNbits API error: ${res.status} ${text}`);
-    throw new Error('LNbits wallet creation failed');
-  }
-  return res.json();
+  if (!res.ok) throw new Error('LNbits account creation returned HTTP '+res.status);
+  const {id:user} = await res.json(); // Never return the account password from this response.
+  if (typeof user !== 'string' || !/^[a-f0-9]{32}$/.test(user)) throw new Error('Invalid account id');
+  const db = openDb(LNBITS_DB_PATH);
+  try {
+    const rows = db.prepare('SELECT id,adminkey,inkey,user FROM wallets WHERE user=? AND deleted=0 LIMIT 2').all(user);
+    if (rows.length !== 1 || !['id','adminkey','inkey'].every(k=>typeof rows[0][k]==='string' && /^[a-f0-9]{32}$/.test(rows[0][k]))) throw new Error('Expected one new wallet');
+    db.prepare('UPDATE wallets SET name=? WHERE user=? AND id=?').run(walletName,user,rows[0].id);
+    return {...rows[0],name:walletName};
+  } finally { db.close(); }
 }
 
 /**
@@ -769,6 +773,8 @@ const server = createServer(async (req, res) => {
 
     // Use a configured audience, never Host or forwarded host headers.
     const parsedUrl = new URL(req.url, BASE_URL);
+    if (parsedUrl.origin !== BASE_URL || req.url.split('?')[0] !== parsedUrl.pathname || parsedUrl.hash) return jsonResponse(res,400,{error:'Invalid request target'});
+    if (['GET','DELETE','OPTIONS','HEAD'].includes(req.method) && (req.headers['transfer-encoding'] || Number(req.headers['content-length'] || 0)!==0)) return jsonResponse(res,400,{error:'Unexpected request body'});
     if (await handleTerminal(req, res, parsedUrl, clientIp)) return;
     const legacyPaths = ['/api/provision/challenge','/api/provision','/api/claim-username','/api/release-username'];
     if (legacyPaths.includes(parsedUrl.pathname)) {
@@ -827,8 +833,8 @@ const server = createServer(async (req, res) => {
 
     // POST /api/v2/provision
     if (req.method === 'POST' && parsedUrl.pathname === '/api/v2/provision') {
-      if (!LNBITS_ADMIN_KEY) {
-        return jsonResponse(res, 500, { error: 'Server not configured: missing LNBITS_ADMIN_KEY' });
+      if (!provisionToken) {
+        return jsonResponse(res, 500, { error: 'Server not configured: missing provisionToken' });
       }
 
       const body = operationBody;
@@ -838,8 +844,8 @@ const server = createServer(async (req, res) => {
         return jsonResponse(res, 400, { error: 'Missing or invalid "name" field' });
       }
 
-      const sanitizedName = sanitizeString(name).slice(0, WALLET_NAME_MAX);
-      if (!sanitizedName) {
+      const sanitizedName = name;
+      if (!name.trim() || name.length > WALLET_NAME_MAX || sanitizeString(name)!==name) {
         return jsonResponse(res, 400, { error: 'Invalid wallet name' });
       }
 
@@ -892,7 +898,7 @@ const server = createServer(async (req, res) => {
         return jsonResponse(res, 400, { error: 'Missing or invalid "username" field' });
       }
 
-      const sanitizedUsername = sanitizeString(username);
+      const sanitizedUsername = username;
       if (!USERNAME_RE.test(sanitizedUsername)) {
         return jsonResponse(res, 400, { error: '3-30 characters, lowercase letters, numbers, dots, hyphens, underscores. Must start and end with alphanumeric.' });
       }
@@ -982,7 +988,7 @@ const server = createServer(async (req, res) => {
     // GET /api/lightning-address?pubkey=<hex>
     if (req.method === 'GET' && parsedUrl.pathname === '/api/lightning-address') {
       const pubkey = parsedUrl.searchParams.get('pubkey');
-      if (!pubkey || !PUBKEY_RE.test(pubkey)) {
+      if (parsedUrl.searchParams.getAll('pubkey').length !== 1 || !pubkey || !PUBKEY_RE.test(pubkey)) {
         return jsonResponse(res, 400, { error: 'Invalid or missing pubkey parameter' });
       }
 
@@ -1105,30 +1111,7 @@ const server = createServer(async (req, res) => {
           parsedUrl.pathname = '/lnurlp/api/v1/lnurl/' + target;
         }
       }
-      // Use parsedUrl.pathname (normalized) instead of raw req.url
-      let proxyPath = parsedUrl.pathname + parsedUrl.search;
-      // NIP-57 fix (issue #8): some clients double-URL-encode the `nostr` zap
-      // request. LNbits decodes the query once, so the value is still
-      // percent-encoded and lnurlp's send_zap() crashes on json.loads(),
-      // never publishing the kind:9735 receipt (the invoice still settles).
-      // If we detect a double-encoded `nostr`, rebuild the query with it
-      // encoded exactly once. Correctly single-encoded clients are untouched.
-      const nostrParam = parsedUrl.searchParams.get('nostr');
-      if (nostrParam !== null && !nostrParam.trimStart().startsWith('{')) {
-        let decoded = nostrParam;
-        for (let i = 0; i < 4 && !decoded.trimStart().startsWith('{'); i++) {
-          try {
-            const next = decodeURIComponent(decoded);
-            if (next === decoded) break;
-            decoded = next;
-          } catch (e) { break; }
-        }
-        if (decoded.trimStart().startsWith('{')) {
-          parsedUrl.searchParams.set('nostr', decoded);
-          proxyPath = parsedUrl.pathname + '?' + parsedUrl.searchParams.toString();
-        }
-      }
-      proxyToLnbits(req, res, proxyPath);
+      proxyToLnbits(req,res,upstreamPath(parsedUrl,req.method));
       return;
     }
 
@@ -1146,11 +1129,11 @@ const server = createServer(async (req, res) => {
       if (parsedUrl.searchParams.has('api-key')) {
         return jsonResponse(res, 400, { error: 'Pass the wallet key in the X-Api-Key header, not the query string' });
       }
-      const proxyPath = parsedUrl.pathname + parsedUrl.search;
+      const proxyPath = upstreamPath(parsedUrl,req.method);
       try {
         if (req.method === 'POST') {
           const body = await readBody(req);
-          proxyWalletApi(req, res, proxyPath, body);
+          proxyWalletApi(req, res, proxyPath, walletBody(body));
         } else {
           proxyWalletApi(req, res, proxyPath, null);
         }
@@ -1179,8 +1162,8 @@ const server = createServer(async (req, res) => {
           healthy = false;
         }
       }
-      checks.adminKey = LNBITS_ADMIN_KEY ? 'set' : 'missing';
-      if (!LNBITS_ADMIN_KEY) healthy = false;
+      checks.provisionToken = provisionToken ? 'set' : 'missing';
+      if (!provisionToken) healthy = false;
       try {
         const upstream = await fetch(`${LNBITS_URL}/api/v1/health`, {
           signal: AbortSignal.timeout(5_000),
@@ -1196,7 +1179,8 @@ const server = createServer(async (req, res) => {
 
     jsonResponse(res, 404, { error: 'Not found' });
   } catch (e) {
-    console.error('[server] unhandled error:', e);
+    if (e instanceof InvalidInput) return jsonResponse(res,400,{error:'Invalid request parameters'});
+    console.error('[server] unhandled error:', e.message);
     if (!res.headersSent) {
       jsonResponse(res, 500, { error: 'Internal server error' });
     }
@@ -1205,7 +1189,7 @@ const server = createServer(async (req, res) => {
 
 // Fail at startup rather than reporting "online" while every request 500s.
 const startupProblems = [];
-if (!LNBITS_ADMIN_KEY) startupProblems.push('LNBITS_ADMIN_KEY is not set');
+if (!provisionToken) startupProblems.push('provisionToken is not set');
 for (const [label, path] of [['LNBITS_DB_PATH', LNBITS_DB_PATH], ['LNURLP_DB_PATH', LNURLP_DB_PATH]]) {
   if (!existsSync(path)) startupProblems.push(`${label} does not exist: ${path}`);
 }

@@ -96,7 +96,7 @@ Forwarded through the allowlist; nothing else is. Operator-reserved Lightning Ad
 ```
 GET       /.well-known/lnurlp/{username}      public, permissive CORS
 GET       /lnurlp/api/v1/lnurl/cb/{id}        public, permissive CORS
-GET|POST  /api/v1/wallet                      requires X-Api-Key
+GET       /api/v1/wallet                      requires X-Api-Key
 GET|POST  /api/v1/payments                    requires X-Api-Key
 GET       /api/v1/payments/fee-reserve        requires X-Api-Key, GET only
 ```
@@ -184,12 +184,12 @@ Otherwise every visitor behind one edge shares a single bucket.
 
 ## Configuration
 
-Copy `.env.example`. Only `LNBITS_ADMIN_KEY` is required.
+Copy `.env.example`. Configure the provisioning token before starting the service.
 
 | Variable | Default | Description |
 |---|---|---|
 | `LNBITS_URL` | `http://127.0.0.1:5000` | LNbits backend |
-| `LNBITS_ADMIN_KEY` | *(required)* | LNbits super-user key, never forwarded to clients |
+| `LNBITS_PROVISION_TOKEN_FILE` | `/etc/zaps-provision/user-create.token` | Mode 0600 file containing a dedicated admin account’s Users-write ACL token; forwarded only to the fixed loopback user-creation endpoint |
 | `LNBITS_DB_PATH` | `/home/lnbits/lnbits/data/database.sqlite3` | LNbits database |
 | `LNURLP_DB_PATH` | `/home/lnbits/lnbits/data/ext_lnurlp.sqlite3` | lnurlp extension database |
 | `PROVISION_DB_PATH` | `/srv/zaps-provision/provisioning.sqlite3` | Proxy-owned pubkey to wallet mapping |
@@ -213,16 +213,7 @@ account without proving they hold the Nostr key.
 **`PROVISION_DB_PATH` must not be writable by the LNbits user.** That file permission is
 what makes wallet ownership trustworthy.
 
-On an instance that predates this file, import the existing mapping:
-
-```bash
-node scripts/backfill-provisioned.mjs --dry-run
-node scripts/backfill-provisioned.mjs
-```
-
-It is idempotent and verifies that every pubkey resolves to the same wallet and keys as
-before, exiting non-zero otherwise. `deploy.sh` runs it before restarting and aborts the
-deploy if verification fails.
+Deploys verify mapped wallet and account IDs without importing ownership from LNbits. For recovery, restore a trusted mapping backup. Do not infer ownership from an account profile.
 
 ## Owned Lightning Address aliases
 
@@ -245,7 +236,7 @@ Node 24+ is required; `node:sqlite` is experimental before it.
 ## Deployment
 
 `./deploy.sh` treats the git checkout as the source of truth. It refuses to run from a
-dirty tree, backs up what it replaces with a dated stamp, migrates the wallet mapping,
+dirty tree, backs up what it replaces with a dated stamp, verifies the wallet mapping,
 installs the proxy, the monitor and the phoenixd watchdog units, restarts only the proxy
 process, and verifies the result.
 
@@ -255,7 +246,7 @@ process, and verifies the result.
 ./deploy.sh --ref <ref>  # roll back to a specific ref
 ```
 
-Before migrating the mapping it copies it with `scripts/backup-provision-db.mjs`
+Before checking the mapping it copies it with `scripts/backup-provision-db.mjs`
 (`VACUUM INTO`, verified by reopening the copy) into `$PROVISION_DIR/backups`, keeping
 the newest ten, and aborts without restarting if that copy cannot be made. Code
 backups beside the installed files are pruned to the newest ten per file.

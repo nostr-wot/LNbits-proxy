@@ -86,7 +86,7 @@ run node --check monitor/monitor.mjs
 # Tests need dev deps; skip them here and rely on CI plus a pre-deploy `npm test`.
 
 say "Comparing against what is live"
-for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs; do
+for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs request-policy.mjs; do
   if [ ! -f "$PROVISION_DIR/$f" ]; then
     echo "  $f is not installed yet and will be created"
   elif diff -q "$f" "$PROVISION_DIR/$f" >/dev/null; then
@@ -97,7 +97,7 @@ for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs; do
 done
 
 say "Backing up the live files"
-for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs; do
+for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs request-policy.mjs; do
   [ -f "$PROVISION_DIR/$f" ] && run cp -a "$PROVISION_DIR/$f" "$PROVISION_DIR/$f.bak-$STAMP"
 done
 [ -f "$MONITOR_DIR/monitor.mjs" ] && run cp -a "$MONITOR_DIR/monitor.mjs" "$MONITOR_DIR/monitor.mjs.bak-$STAMP"
@@ -114,6 +114,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 say "Installing the proxy into $PROVISION_DIR"
+run install -m 0644 request-policy.mjs "$PROVISION_DIR/request-policy.mjs"
 run install -m 0644 server.js "$PROVISION_DIR/server.js"
 run install -m 0644 nwc-connections.mjs "$PROVISION_DIR/nwc-connections.mjs"
 run install -m 0644 auth-v2.mjs "$PROVISION_DIR/auth-v2.mjs"
@@ -175,29 +176,15 @@ elif ! node scripts/backup-provision-db.mjs "$PROVISION_DB" "$PROVISION_DIR/back
   exit 1
 fi
 
-say "Migrating the pubkey to wallet mapping"
-# This MUST happen before the new code starts serving. The proxy resolves
-# wallets from its own table now; if that table were empty when the new code
-# went live, every returning user would look unprovisioned and be given a NEW
-# wallet, stranding the funds in their old one. The script is idempotent and
-# verifies that every pubkey still resolves to exactly the wallet it did before,
-# exiting non-zero if even one does not.
-if [ -f scripts/backfill-provisioned.mjs ]; then
-  if [ "$DRY_RUN" -eq 1 ]; then
-    run node scripts/backfill-provisioned.mjs --dry-run
-  else
-    if ! PROVISION_DB_PATH="${PROVISION_DB_PATH:-$PROVISION_DIR/provisioning.sqlite3}" \
-         node scripts/backfill-provisioned.mjs; then
-      echo "  ABORTING: mapping migration failed verification; $PM2_APP was NOT restarted" >&2
-      exit 1
-    fi
-    chmod 600 "${PROVISION_DB_PATH:-$PROVISION_DIR/provisioning.sqlite3}" 2>/dev/null || true
-  fi
+# A deployment must never import ownership from user-editable accounts.pubkey.
+if [ "$DRY_RUN" -eq 0 ]; then
+  node scripts/verify-mappings.mjs "$PROVISION_DB"
+  chmod 600 "$PROVISION_DB"
 fi
 
 restore_proxy() {
   echo "Restoring the previous proxy files" >&2
-  for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs; do
+  for f in server.js nwc-connections.mjs auth-v2.mjs terminal-nfc.mjs request-policy.mjs; do
     if [ -f "$PROVISION_DIR/$f.bak-$STAMP" ]; then
       cp -a "$PROVISION_DIR/$f.bak-$STAMP" "$PROVISION_DIR/$f" || return 1
     fi
@@ -243,16 +230,6 @@ check "wallet auth (no key)" 401 "$BASE_URL/api/v1/wallet"
 check "nwc (no key)"         401 "$BASE_URL/api/nwc/connections"
 check "delete-account is POST" 405 "$BASE_URL/api/v2/delete-account"
 check "unknown path"         404 "$BASE_URL/api/nope"
-
-if [ -f scripts/backfill-provisioned.mjs ]; then
-  if PROVISION_DB_PATH="${PROVISION_DB_PATH:-$PROVISION_DIR/provisioning.sqlite3}" \
-     node scripts/backfill-provisioned.mjs --verify-only >/dev/null 2>&1; then
-    printf '  ok    %-34s every pubkey resolves as before\n' "wallet mapping"
-  else
-    printf '  FAIL  %-34s verification failed\n' "wallet mapping"
-    fail=1
-  fi
-fi
 
 if [ -x "$MONITOR_DIR/run-monitor.sh" ] && [ -r "$MONITOR_DIR/zaps-monitor.env" ]; then
   if MONITOR_ENV_FILE="$MONITOR_DIR/zaps-monitor.env" "$MONITOR_DIR/run-monitor.sh" >/dev/null 2>&1; then
