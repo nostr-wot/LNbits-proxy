@@ -39,7 +39,7 @@ import { createServer, request as httpRequest } from 'node:http';
 import { createNwcRoutes } from './nwc-connections.mjs';
 import { InvalidInput, walletBody, upstreamPath } from './request-policy.mjs';
 import { existsSync, readFileSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createAuth, publicOrigin, allowedOrigins, clientScope, AUTH_PATHS, CHALLENGE_PATH } from './auth-v2.mjs';
 
@@ -106,6 +106,10 @@ function openProvisionDb() {
         user_id    TEXT NOT NULL,
         wallet_id  TEXT NOT NULL,
         created_at REAL NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS wallet_key_history (
+        pubkey TEXT NOT NULL, user_id TEXT NOT NULL, wallet_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        PRIMARY KEY (pubkey, user_id, wallet_id, fingerprint)
       );
       CREATE TABLE IF NOT EXISTS lightning_aliases (
         username TEXT PRIMARY KEY,
@@ -403,6 +407,19 @@ function proxyWalletApi(clientReq, clientRes, proxiedPath, body) {
     proxy.end(body);
   } else {
     proxy.end();
+  }
+}
+
+function rememberWalletKey(pubkey, wallet, previousKeyHash) {
+  const db = openProvisionDb();
+  const owner = [pubkey, wallet.user, wallet.id];
+  try {
+    if (previousKeyHash && !db.prepare('SELECT 1 FROM wallet_key_history WHERE pubkey=? AND user_id=? AND wallet_id=? AND fingerprint=?').get(...owner, previousKeyHash)) return false;
+    const fingerprint = createHash('sha256').update(wallet.adminkey).digest('hex');
+    db.prepare('INSERT OR IGNORE INTO wallet_key_history VALUES (?,?,?,?)').run(...owner, fingerprint);
+    return true;
+  } finally {
+    db.close();
   }
 }
 
@@ -746,6 +763,7 @@ async function deleteAccount(pubkey, acknowledgeBalance) {
   const proxyDb = openProvisionDb();
   try {
     proxyDb.exec('BEGIN IMMEDIATE');
+    proxyDb.prepare('DELETE FROM wallet_key_history WHERE pubkey = ?').run(pubkey);
     const removed = proxyDb.prepare('DELETE FROM provisioned WHERE pubkey = ?').run(pubkey).changes;
     if (removed) {
       proxyDb.prepare('INSERT INTO account_deletions (deleted_at, forfeited_msat) VALUES (?, ?)')
@@ -819,7 +837,9 @@ const server = createServer(async (req, res) => {
         catch(e) { return jsonResponse(res,e.message.startsWith('Server busy')?503:400,{error:e.message}); }
       }
       const keys = Object.keys(operationBody).sort().join(',');
-      if (keys !== AUTH_ROUTES[parsedUrl.pathname].fields) return jsonResponse(res,400,{error:'Unexpected operation fields'});
+      const recovery = parsedUrl.pathname === '/api/v2/provision' && keys === 'previousKeyHash'
+        && typeof operationBody.previousKeyHash === 'string' && /^[a-f0-9]{64}$/.test(operationBody.previousKeyHash);
+      if (!recovery && keys !== AUTH_ROUTES[parsedUrl.pathname].fields) return jsonResponse(res,400,{error:'Unexpected operation fields'});
     }
     const verifyOperation = () => {
       try { return auth.verify({authorization:req.headers.authorization,token:req.headers['x-nostr-transaction'],raw:operationRaw,url:BASE_URL+req.url,scope}); }
@@ -840,12 +860,8 @@ const server = createServer(async (req, res) => {
       const body = operationBody;
 
       const { name } = body;
-      if (!name || typeof name !== 'string') {
-        return jsonResponse(res, 400, { error: 'Missing or invalid "name" field' });
-      }
-
-      const sanitizedName = name;
-      if (!name.trim() || name.length > WALLET_NAME_MAX || sanitizeString(name)!==name) {
+      const recovery = Object.hasOwn(body, 'previousKeyHash');
+      if (!recovery && (typeof name !== 'string' || !name.trim() || name.length > WALLET_NAME_MAX || sanitizeString(name)!==name)) {
         return jsonResponse(res, 400, { error: 'Invalid wallet name' });
       }
 
@@ -860,12 +876,19 @@ const server = createServer(async (req, res) => {
       try {
         // Check if this pubkey already has a wallet
         const existing = findWalletByPubkey(verified.pubkey);
+        if (recovery) {
+          if (!existing || !rememberWalletKey(verified.pubkey, existing, body.previousKeyHash)) {
+            return jsonResponse(res, 409, {error:'Saved wallet could not be verified'});
+          }
+          return jsonResponse(res, 200, {id:existing.id, adminkey:existing.adminkey});
+        }
         if (existing) {
+          rememberWalletKey(verified.pubkey, existing);
           return jsonResponse(res, 200, existing);
         }
 
         // Create new wallet via LNbits
-        const wallet = await createLnbitsWallet(sanitizedName);
+        const wallet = await createLnbitsWallet(name);
         try {
           linkWalletToPubkey(wallet.user, wallet.id, verified.pubkey);
         } catch (e) {
@@ -879,6 +902,7 @@ const server = createServer(async (req, res) => {
             error: 'Wallet created but could not be linked to your key. Do not retry; contact the operator.',
           });
         }
+        rememberWalletKey(verified.pubkey, wallet);
         return jsonResponse(res, 201, wallet);
       } catch (e) {
         console.error(`[provision] error: ${e.message}`);

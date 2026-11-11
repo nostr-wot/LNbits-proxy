@@ -6,6 +6,10 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
+## 1.0.6 — 2026-11-11
+
+- Recover a rotated hosted-wallet key when the signed Nostr account and the saved credential fingerprint match the existing wallet.
+
 ## 1.0.5 — 2026-11-11
 
 - Restore signed onboarding with anonymous LNbits registration disabled. Restrict forwarded payment and LNURL inputs to the hosted wallet contract, and verify the existing ownership mapping without importing account profile data.
