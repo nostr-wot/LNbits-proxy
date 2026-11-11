@@ -75,7 +75,15 @@ test('HTTP v2 boundary rejects legacy, mutation, query, origin, replay; recovers
     const headers = await signOperation(path,body,owner);
     return call(path,body,{...headers,'X-Forwarded-For':'192.0.2.100'});
   }
-  const refreshed = await recover(sha256('test-admin'));
+  const recoveryPath = '/api/v2/provision';
+  const recoveryBody = {previousKeyHash:sha256('test-admin')};
+  const signedRecovery = {...await signOperation(recoveryPath,recoveryBody), 'X-Forwarded-For':'192.0.2.101'};
+  const responses = await Promise.all([call(recoveryPath,recoveryBody,signedRecovery), call(recoveryPath,recoveryBody,signedRecovery)]);
+  assert.deepEqual(responses.map(r=>r.status).sort(),[200,403]);
+  const refused = responses.find(r=>r.status===403);
+  assert.deepEqual(Object.keys(await refused.json()),['error']);
+  const refreshed = responses.find(r=>r.status===200);
+  assert.equal(refreshed.headers.get('cache-control'),'no-store');
   assert.equal(refreshed.status,200);
   assert.deepEqual(await refreshed.json(),{id:'wallet',adminkey:'new-admin'});
   assert.equal((await recover(sha256('unrelated'))).status,409);
