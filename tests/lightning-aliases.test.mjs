@@ -25,7 +25,7 @@ test('owned aliases route safely, persist, reject strangers and permit owner rec
  let delayNext, upstreamArrived;
  const upstream=createServer(async(req,res)=>{if(delayNext){const wait=delayNext;delayNext=null;upstreamArrived();await wait;const target=req.url.startsWith('/.well-known/')?db.prepare('SELECT wallet FROM pay_links WHERE username=?').get(req.url.split('/').at(-1)):db.prepare('SELECT wallet FROM pay_links WHERE id=?').get(req.url.split('/').at(-1));res.setHeader('Content-Type','application/json');res.end(JSON.stringify({wallet:target?.wallet ?? null}));return;}res.setHeader('Content-Type','application/json');res.end(JSON.stringify({path:req.url,host:req.headers.host}));});
  await new Promise(r=>upstream.listen(0,'127.0.0.1',r));
- const env={...process.env,PORT:'0',PUBLIC_ORIGIN:'https://zaps.nostr-wot.com',LNBITS_URL:`http://127.0.0.1:${upstream.address().port}`,LNBITS_ADMIN_KEY:'test',LNBITS_DB_PATH:dbPath,LNURLP_DB_PATH:dbPath,PROVISION_DB_PATH:mapping};
+ const env={...process.env,PORT:'0',PUBLIC_ORIGIN:'https://zaps.nostr-wot.com',LNBITS_URL:`http://127.0.0.1:${upstream.address().port}`,LNBITS_PROVISION_TOKEN:'test',LNBITS_DB_PATH:dbPath,LNURLP_DB_PATH:dbPath,PROVISION_DB_PATH:mapping};
  // Reserve a free port because the proxy logs configured PORT rather than its assigned port.
  const portServer=createServer(); await new Promise(r=>portServer.listen(0,'127.0.0.1',r));env.PORT=String(portServer.address().port);await new Promise(r=>portServer.close(r));
  const local=`http://127.0.0.1:${env.PORT}`;
@@ -48,7 +48,7 @@ test('owned aliases route safely, persist, reject strangers and permit owner rec
  db.exec("UPDATE pay_links SET username='moved' WHERE id='pay'; INSERT INTO pay_links(id,wallet,username) VALUES('takeover','stranger-wallet','primary')");
  releaseUpstream();assert.equal((await(await pending).json()).wallet,'owner-wallet','in-flight alias must stay bound to its checked pay-link ID');
  db.exec("DELETE FROM pay_links WHERE id='takeover'; UPDATE pay_links SET username='primary' WHERE id='pay'");
- const zap=JSON.stringify({kind:9734});const callback=await fetch(local+'/lnurlp/api/v1/lnurl/cb/pay?nostr='+encodeURIComponent(encodeURIComponent(zap)));assert.equal(new URL('https://test'+(await callback.json()).path).searchParams.get('nostr'),zap);
+ const zap=JSON.stringify(finalizeEvent({kind:9734,created_at:1,content:'',tags:[['p',pubkey],['relays','wss://relay.example']]}, key));const callback=await fetch(local+'/lnurlp/api/v1/lnurl/cb/pay?amount=1000&nostr='+encodeURIComponent(encodeURIComponent(zap)));assert.equal(new URL('https://test'+(await callback.json()).path).searchParams.get('nostr'),zap);
  let counter=0;
  async function operation(path,body,secret=key){const ip=`192.0.2.${++counter}`,url=env.PUBLIC_ORIGIN+path,payload=sha256(JSON.stringify(body));const post=(path,body,headers={})=>fetch(local+path,{method:'POST',headers:{'Content-Type':'application/json','X-Forwarded-For':ip,...headers},body:JSON.stringify(body)});const issued=await(await post('/api/v2/provision/challenge',{url,method:'POST',payload})).json();const event=finalizeEvent({kind:27235,created_at:Math.floor(Date.now()/1000),content:'',tags:[['u',url],['method','POST'],['payload',payload],['challenge',issued.challenge],['transaction',sha256(issued.transactionToken)]]},secret);return post(path,body,{Authorization:'Nostr '+Buffer.from(JSON.stringify(event)).toString('base64'),'X-Nostr-Transaction':issued.transactionToken});}
  assert.equal((await operation('/api/v2/release-username',{})).status,200);

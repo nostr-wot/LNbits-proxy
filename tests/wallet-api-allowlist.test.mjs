@@ -47,7 +47,7 @@ async function startProxy(t) {
       ...process.env,
       PORT: String(port),
       LNBITS_URL: `http://127.0.0.1:${lnbits.address().port}`,
-      LNBITS_ADMIN_KEY: 'admin-key-not-forwarded',
+      LNBITS_PROVISION_TOKEN: 'admin-key-not-forwarded',
       LNBITS_DB_PATH: join(dir, 'lnbits.sqlite3'),
       LNURLP_DB_PATH: join(dir, 'ext_lnurlp.sqlite3'),
       PROVISION_DB_PATH: join(dir, 'provisioning.sqlite3'),
@@ -71,10 +71,10 @@ async function startProxy(t) {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  const call = (path, { method = 'GET', key = KEY } = {}) =>
+  const call = (path, { method = 'GET', key = KEY, body } = {}) =>
     fetch(`http://127.0.0.1:${port}${path}`, {
       method,
-      headers: key === null ? {} : { 'X-Api-Key': key },
+      headers: key === null ? {} : { 'X-Api-Key': key, 'Content-Type':'application/json' }, body:body && JSON.stringify(body),
     });
 
   return { call, seen };
@@ -134,13 +134,12 @@ test('the wallet paths that were already allowlisted keep working', async (t) =>
   const { call, seen } = await startProxy(t);
 
   assert.equal((await call('/api/v1/wallet')).status, 200);
-  assert.equal((await call('/api/v1/wallet', { method: 'POST' })).status, 200);
+  assert.equal((await call('/api/v1/wallet', { method: 'POST' })).status, 404);
   assert.equal((await call('/api/v1/payments')).status, 200);
-  assert.equal((await call('/api/v1/payments', { method: 'POST' })).status, 200);
+  assert.equal((await call('/api/v1/payments', { method: 'POST', body:{out:false,amount:1} })).status, 200);
 
   assert.deepEqual(seen.map(r => `${r.method} ${r.url}`), [
     'GET /api/v1/wallet',
-    'POST /api/v1/wallet',
     'GET /api/v1/payments',
     'POST /api/v1/payments',
   ]);

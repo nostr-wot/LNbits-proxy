@@ -56,7 +56,7 @@ export function createNwcRoutes({backend,dbPath,fetchFn=fetch}) {
           }
           if(tooLarge){send(res,413,{error:'Request too large'});return true;}
           const input=JSON.parse(Buffer.concat(chunks).toString());
-          if(typeof input.name!=='string'||!input.name.trim()||input.name.trim().length>50||[...input.name].some(c=>c.charCodeAt(0)<32||c.charCodeAt(0)===127)
+          if(!input || Object.keys(input).sort().join(',')!=='dailyLimit,days,name' || typeof input.name!=='string'||!input.name.trim()||input.name.trim().length>50||[...input.name].some(c=>c.charCodeAt(0)<32||c.charCodeAt(0)===127)
              ||!Number.isSafeInteger(input.dailyLimit)||input.dailyLimit<=0||input.dailyLimit>=10000000
              ||!Number.isSafeInteger(input.days)||input.days<1||input.days>365) {send(res,400,{error:'Invalid connection settings'});return true;}
           // Explicit user action enables this installed extension for their own LNbits account.

@@ -83,12 +83,12 @@ database, then have the user retry. The orphan is an empty wallet and safe to le
 
 ### A returning user is offered a new wallet instead of theirs
 
-Their pubkey is missing from the mapping database. Check it and re-import if needed:
+Their pubkey is missing from the mapping database. Check it against a trusted backup:
 
 ```bash
 sqlite3 /srv/zaps-provision/provisioning.sqlite3 \
   "SELECT wallet_id FROM provisioned WHERE pubkey='<hex>'"
-node scripts/backfill-provisioned.mjs --verify-only
+node scripts/verify-mappings.mjs /srv/zaps-provision/provisioning.sqlite3
 ```
 
 `--verify-only` confirms every pubkey resolves to the wallet it should. Do not let a user
@@ -300,13 +300,7 @@ guideline 5.1.1(v)). The README has the wire contract. What it does, in order:
 A failure at any step returns 502 or 500 and leaves the earlier steps done; the next
 call repeats the finished ones harmlessly and completes the rest.
 
-**Why direct database writes and not the LNbits API.** LNbits' user-management API
-(`DELETE /users/api/v1/user/{id}` and `.../wallet/{id}`) only accepts an admin
-*account* session or access token, not the wallet key this proxy holds as
-`LNBITS_ADMIN_KEY`. The proxy already writes LNbits' `accounts`, `extensions` and
-`pay_links` tables directly, so deletion reverses provisioning the same way. The rows
-are hard-deleted, which is stronger than LNbits' own admin delete (that one only
-flags wallets `deleted` and keeps their rows).
+**Why deletion uses database transactions.** Provisioning holds a Users-write API token solely for the fixed user-creation endpoint. Deletion retains its wallet-scoped revocation and transaction checks so an account is not removed with unacknowledged funds or pending outgoing payments.
 
 **Limitations to know about:**
 
@@ -430,3 +424,9 @@ Verify each alias with `GET /.well-known/lnurlp/<name>`, then compare the callba
 On 2026-11-03, an already-running installer checked out a new release but continued its previous file-install list. The new server imported a module that was not copied to runtime, causing proxy HTTP 502 responses. LNbits and the Lightning node remained running. Restoring the prior proxy files recovered access; rerunning the selected release’s installer installed the missing module.
 
 The installer now re-executes after a revision change, checks local imports before restart, and automatically restores backed-up proxy files when verification fails. For the first upgrade from an older installer without this safeguard, check out the reviewed release before launching deploy.sh. Never restart LNbits or phoenixd to repair a proxy module error. A PM2 online label alone does not establish health; verify the HTTP health endpoint and authenticated route guards.
+
+## Provisioning with LNbits 1.7.1
+
+Keep anonymous account creation off. Use a dedicated, password-protected LNbits admin account (not the superuser). In its access control lists, enable only **write** for **Users**. LNbits scopes this ACL to the Users API group, not a single endpoint. Issue a time-limited API token and install it in the proxy's private token file. The proxy sends it only to loopback, as a Bearer credential on POST /users/api/v1/user. Never use a wallet admin key here. For renewal, atomically replace the file, restart the proxy, verify signed onboarding with an empty test wallet, and revoke the previous token. Record the expiration date with the operator.
+
+The public wallet routes support wallet reads, bounded payment history, invoice fee quotes, issuing a sat-denominated invoice, and paying an existing invoice. Payment bodies require a boolean out and reject unsupported fields; unknown query options are discarded, duplicate supported options are rejected. LNURL callbacks accept amount, expiry, comment, and signed NIP-57 nostr requests. Unsigned metadata, callback hooks and credentials from callers are never passed through to the payment backend. Keep HTTP access logs on the edge free of raw URLs: terminal capabilities, invoices and payer comments can appear there.

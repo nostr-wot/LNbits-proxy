@@ -64,7 +64,7 @@ export function terminalHandler({ mailbox, readBody, allow }) {
       const [, id, action] = match;
       if (req.method === 'GET' && !action && !url.search) return send(200, mailbox.discover(id));
       if (req.method === 'GET' && action === '/callback') {
-        requireValid(url.searchParams.getAll('k1').length === 1 && url.searchParams.getAll('pr').length === 1);
+        requireValid(url.searchParams.size===2 && url.searchParams.getAll('k1').length === 1 && url.searchParams.getAll('pr').length === 1);
         return send(200, mailbox.submit(id, url.searchParams.get('k1'), url.searchParams.get('pr')));
       }
       const auth = req.headers.authorization;

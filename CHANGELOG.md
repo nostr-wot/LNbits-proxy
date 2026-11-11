@@ -6,6 +6,10 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
+## 1.0.5 — 2026-11-11
+
+- Restore signed onboarding with anonymous LNbits registration disabled. Restrict forwarded payment and LNURL inputs to the hosted wallet contract, and verify the existing ownership mapping without importing account profile data.
+
 ## 1.0.4 — 2026-11-03
 
 - Run the selected release’s installer after checkout, verify local runtime imports before restart, and restore the previous proxy files if post-deployment checks fail. This prevents new modules being omitted by an older running installer.

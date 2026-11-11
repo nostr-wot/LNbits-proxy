@@ -109,7 +109,7 @@ async function setup(t) {
   const child = spawn(process.execPath, [SERVER], {
     env: {
       ...process.env, PORT: String(port), PUBLIC_ORIGIN: ORIGIN, BROWSER_ORIGINS: 'https://client.test',
-      LNBITS_URL: `http://127.0.0.1:${stub.address().port}`, LNBITS_ADMIN_KEY: 'test-only',
+      LNBITS_URL: `http://127.0.0.1:${stub.address().port}`, LNBITS_PROVISION_TOKEN: 'test-only',
       LNBITS_DB_PATH: lnbitsPath, LNURLP_DB_PATH: lnurlpPath, PROVISION_DB_PATH: provisionPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
