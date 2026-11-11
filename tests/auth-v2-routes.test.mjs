@@ -61,12 +61,26 @@ test('HTTP v2 boundary rejects legacy, mutation, query, origin, replay; recovers
   const browserHeaders={Origin:'https://client.test',Authorization:'Nostr '+Buffer.from(JSON.stringify(browserEvent)).toString('base64'),'X-Nostr-Transaction':browserChallenge.transactionToken};
   const browserResponse=await call('/api/v2/provision',{name:'wallet'},browserHeaders);
   assert.equal(browserResponse.status,200);assert.equal(browserResponse.headers.get('access-control-allow-origin'),'https://client.test');assert.equal(browserResponse.headers.get('vary'),'Origin');
-  async function signOperation(path,body) {
+  async function signOperation(path,body,owner=key) {
     const target='https://wallet.test'+path, payload=sha256(JSON.stringify(body));
     const issued=await (await call('/api/v2/provision/challenge',{url:target,method:'POST',payload})).json();
-    const event=finalizeEvent({kind:27235,created_at:Math.floor(Date.now()/1000),content:'',tags:[['u',target],['method','POST'],['payload',payload],['challenge',issued.challenge],['transaction',sha256(issued.transactionToken)]]},key);
+    const event=finalizeEvent({kind:27235,created_at:Math.floor(Date.now()/1000),content:'',tags:[['u',target],['method','POST'],['payload',payload],['challenge',issued.challenge],['transaction',sha256(issued.transactionToken)]]},owner);
     return {Authorization:'Nostr '+Buffer.from(JSON.stringify(event)).toString('base64'),'X-Nostr-Transaction':issued.transactionToken};
   }
+  db = new DatabaseSync(dbPath);
+  db.prepare('UPDATE wallets SET adminkey=? WHERE id=?').run('new-admin','wallet');
+  db.close();
+  async function recover(hash,owner=key) {
+    const body = {previousKeyHash:hash}, path='/api/v2/provision';
+    const headers = await signOperation(path,body,owner);
+    return call(path,body,{...headers,'X-Forwarded-For':'192.0.2.100'});
+  }
+  const refreshed = await recover(sha256('test-admin'));
+  assert.equal(refreshed.status,200);
+  assert.deepEqual(await refreshed.json(),{id:'wallet',adminkey:'new-admin'});
+  assert.equal((await recover(sha256('unrelated'))).status,409);
+  assert.equal((await recover(sha256('test-admin'),generateSecretKey())).status,409);
+  assert.equal(created,0);
   const claimHeaders=await signOperation('/api/v2/claim-username',{username:'alice'});
   assert.equal((await call('/api/v2/claim-username',{username:'mallory'},claimHeaders)).status,403);
   const claimed=await call('/api/v2/claim-username',{username:'alice'},claimHeaders);
