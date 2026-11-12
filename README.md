@@ -373,3 +373,5 @@ At signup, a signed v2 claim-username request with `{"username":"alice","reserve
 `GET /api/username-availability?name=alice` returns an availability boolean and allows 20 checks per IP per minute. This lookup does not reserve the name. The authenticated claim operation decides ownership.
 
 `GET /.well-known/nostr.json?name=alice` returns the NIP-05 names map for a claimed username or active alias. Unknown names return an empty map.
+
+A signed claim-username request with the sole field `receiver` updates the signer’s signup handle. A public Lightning Address delegates LNURL-pay discovery to that wallet over HTTPS. The provider issues invoices directly through its own callback. A null receiver disables payments and `"hosted"` selects the owner’s hosted pay link. The proxy never needs the external wallet credential.

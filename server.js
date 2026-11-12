@@ -34,6 +34,7 @@
  *   PORT             - Listen port (default: 3003)
  */
 
+import { readPayRequest, receiverUrl } from './external-receiver.mjs';
 import { createTerminalMailbox, terminalHandler } from './terminal-nfc.mjs';
 import { createServer, request as httpRequest } from 'node:http';
 import { createNwcRoutes } from './nwc-connections.mjs';
@@ -114,6 +115,10 @@ function openProvisionDb() {
       CREATE TABLE IF NOT EXISTS lightning_aliases (
         username TEXT PRIMARY KEY,
         pubkey TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS signup_receivers (
+        pubkey TEXT PRIMARY KEY,
+        address TEXT
       );
       CREATE TABLE IF NOT EXISTS signup_handles (
         pubkey TEXT PRIMARY KEY,
@@ -795,6 +800,7 @@ async function deleteAccount(pubkey, acknowledgeBalance) {
 
 // ── Request handler ──
 
+let externalLookups = 0;
 const handleTerminal = terminalHandler({ mailbox: createTerminalMailbox({ origin: BASE_URL }), readBody, allow: checkRateLimit });
 
 function aliasPayLink(pubkey) {
@@ -829,6 +835,7 @@ function reserveSignupHandle(username, pubkey) {
 }
 
 function deleteSignupHandle(db, pubkey) {
+  db.prepare('DELETE FROM signup_receivers WHERE pubkey = ?').run(pubkey);
   db.prepare('DELETE FROM lightning_aliases WHERE pubkey = ? AND username IN (SELECT username FROM signup_handles WHERE pubkey = ?)').run(pubkey, pubkey);
   return db.prepare('DELETE FROM signup_handles WHERE pubkey = ?').run(pubkey).changes;
 }
@@ -905,7 +912,8 @@ const server = createServer(async (req, res) => {
       const recovery = parsedUrl.pathname === '/api/v2/provision' && keys === 'previousKeyHash'
         && typeof operationBody.previousKeyHash === 'string' && /^[a-f0-9]{64}$/.test(operationBody.previousKeyHash);
       const signup = parsedUrl.pathname === '/api/v2/claim-username' && keys === 'reserveOnly,username' && operationBody.reserveOnly === true;
-      if (!signup && !recovery && keys !== AUTH_ROUTES[parsedUrl.pathname].fields) return jsonResponse(res,400,{error:'Unexpected operation fields'});
+      const receiverUpdate = parsedUrl.pathname === '/api/v2/claim-username' && keys === 'receiver' && (operationBody.receiver === null || operationBody.receiver === 'hosted' || !!receiverUrl(operationBody.receiver));
+      if (!receiverUpdate && !signup && !recovery && keys !== AUTH_ROUTES[parsedUrl.pathname].fields) return jsonResponse(res,400,{error:'Unexpected operation fields'});
     }
     const verifyOperation = () => {
       try { return auth.verify({authorization:req.headers.authorization,token:req.headers['x-nostr-transaction'],raw:operationRaw,url:BASE_URL+req.url,scope}); }
@@ -983,6 +991,20 @@ const server = createServer(async (req, res) => {
 
       const body = operationBody;
 
+      if (Object.hasOwn(body, 'receiver')) {
+        const verified = verifyOperation();
+        if (!verified) return;
+        const db = openProvisionDb();
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          const handle = db.prepare('SELECT username FROM signup_handles WHERE pubkey = ?').get(verified.pubkey);
+          if (!handle) return jsonResponse(res, 200, { address: null });
+          if (body.receiver === 'hosted') db.prepare('DELETE FROM signup_receivers WHERE pubkey = ?').run(verified.pubkey);
+          else db.prepare('INSERT OR REPLACE INTO signup_receivers (pubkey,address) VALUES (?,?)').run(verified.pubkey, body.receiver);
+          db.exec('COMMIT');
+          return jsonResponse(res, 200, { address: handle.username + '@' + ADDRESS_DOMAIN });
+        } finally { db.close(); }
+      }
       const { username } = body;
       if (!username || typeof username !== 'string') {
         return jsonResponse(res, 400, { error: 'Missing or invalid "username" field' });
@@ -1177,6 +1199,17 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    if (req.method === 'GET' && parsedUrl.pathname === '/api/signup-handle') {
+      if (!checkRateLimit(clientIp, 'nickname')) return jsonResponse(res, 429, { error: 'Too many requests' });
+      const pubkey = parsedUrl.searchParams.get('pubkey');
+      if (!pubkey || !/^[0-9a-f]{64}$/.test(pubkey)) return jsonResponse(res, 400, { error: 'Invalid public key' });
+      const db = openProvisionDb();
+      try {
+        const row = db.prepare('SELECT username FROM signup_handles WHERE pubkey = ?').get(pubkey);
+        return jsonResponse(res, 200, { username: row?.username ?? null });
+      } finally { db.close(); }
+    }
+
     if (req.method === 'GET' && parsedUrl.pathname === '/api/username-availability') {
       if (!checkRateLimit(clientIp, 'nickname')) {
         res.setHeader('Retry-After', '60');
@@ -1213,9 +1246,19 @@ const server = createServer(async (req, res) => {
       if (parsedUrl.pathname.startsWith('/.well-known/lnurlp/')) {
         const username = parsedUrl.pathname.split('/').at(-1);
         const pdb = openProvisionDb();
-        let alias;
-        try { alias = pdb.prepare('SELECT pubkey FROM lightning_aliases WHERE username = ?').get(username); }
-        finally { pdb.close(); }
+        let alias, external;
+        try { alias = pdb.prepare('SELECT pubkey FROM lightning_aliases WHERE username = ?').get(username);
+          external = pdb.prepare('SELECT r.address FROM signup_handles h JOIN signup_receivers r ON r.pubkey=h.pubkey WHERE h.username=?').get(username);
+        } finally { pdb.close(); }
+        if (external) {
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          if (!external.address) return jsonResponse(res, 404, { status: 'ERROR', reason: 'No receiving address connected' });
+          if (externalLookups >= 32) return jsonResponse(res, 503, { status: 'ERROR', reason: 'Try again shortly' });
+          externalLookups++;
+          try { return jsonResponse(res, 200, await readPayRequest(external.address)); }
+          catch { return jsonResponse(res, 502, { status: 'ERROR', reason: 'Receiving wallet unavailable' }); }
+          finally { externalLookups--; }
+        }
         if (alias) {
           const target = aliasPayLink(alias.pubkey);
           if (!target) return jsonResponse(res, 404, { status: 'ERROR', reason: 'Lightning Address unavailable' });

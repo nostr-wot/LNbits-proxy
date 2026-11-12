@@ -83,6 +83,16 @@ test('owned aliases route safely, persist, reject strangers and permit owner rec
  pdb.prepare('INSERT INTO provisioned VALUES(?,?,?,0)').run(laterPubkey,'later-user','later-wallet');
  assert.equal((await get('later')).status,404);
  assert.equal((await claim({username:'later'},laterKey)).status,200);
+ const point=(receiver,owner)=>operation('/api/v2/claim-username',{receiver},owner);
+ assert.equal((await point(null,stranger)).status,200); // Stranger has no signup handle.
+ assert.equal((await get('later')).status,200);
+ assert.equal((await point(null,laterKey)).status,200);
+ assert.equal((await get('later')).status,404);
+ assert.equal((await point('alice@localhost',laterKey)).status,400);
+ assert.equal((await point('alice@wallet.example',laterKey)).status,200);
+ assert.equal(pdb.prepare('SELECT address FROM signup_receivers WHERE pubkey=?').get(laterPubkey).address,'alice@wallet.example');
+ assert.deepEqual(await identity('later'),{later:laterPubkey});
+ assert.equal((await point('hosted',laterKey)).status,200);
  const laterLink=db.prepare("SELECT id FROM pay_links WHERE wallet='later-wallet'").get().id;
  assert.equal((await(await get('later')).json()).path,'/lnurlp/api/v1/lnurl/'+laterLink);
  assert.equal((await operation('/api/v2/release-username',{},laterKey)).status,200);
