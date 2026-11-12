@@ -35,9 +35,22 @@ test('owned aliases route safely, persist, reject strangers and permit owner rec
  t.after(async()=>{if(child?.exitCode===null)await stop();await new Promise(r=>upstream.close(r));db.close();pdb.close();rmSync(dir,{recursive:true,force:true});});
  await start();
  const reserve=(...args)=>spawnSync(process.execPath,['scripts/reserve-lightning-aliases.mjs','--pubkey',pubkey,...args],{cwd:new URL('..',import.meta.url),env,encoding:'utf8'});
+ const identity=async name=>(await(await fetch(local+'/.well-known/nostr.json?name='+name)).json()).names;
+ assert.deepEqual(await identity('primary'),{primary:pubkey});
+ assert.deepEqual(await identity('absent'),{});
  let result=reserve('alias','primary');assert.equal(result.status,0,result.stderr);
  result=reserve('unused','occupied');assert.notEqual(result.status,0);assert.equal(pdb.prepare("SELECT 1 FROM lightning_aliases WHERE username='unused'").get(),undefined,'batch must be atomic');
  result=reserve('--allow-existing-name','occupied','occupied');assert.equal(result.status,0,result.stderr);
+ assert.deepEqual(await identity('occupied'),{occupied:pubkey});
+ const availability = name => fetch(local+'/api/username-availability?name='+name);
+ for (const [name, available] of [['fresh',true],['admin',false],['alias',false],['occupied',false],['primary',false]]) {
+   assert.deepEqual(await (await availability(name)).json(),{available});
+ }
+ assert.equal((await availability('x')).status,400);
+ for (let i=6;i<20;i++) assert.equal((await availability('fresh')).status,200);
+ const limited=await availability('fresh');
+ assert.equal(limited.status,429);
+ assert.equal(limited.headers.get('retry-after'),'60');
  const get=async name=>fetch(local+'/.well-known/lnurlp/'+name);
  for(const name of ['alias','occupied','primary']) {const response=await get(name);assert.equal(response.status,200);assert.deepEqual(await response.json(),{path:'/lnurlp/api/v1/lnurl/pay',host:'zaps.nostr-wot.com'});}
  assert.equal((await (await fetch(local+'/api/lightning-address?pubkey='+pubkey)).json()).address,'primary@nostrwot.com');
@@ -53,6 +66,7 @@ test('owned aliases route safely, persist, reject strangers and permit owner rec
  async function operation(path,body,secret=key){const ip=`192.0.2.${++counter}`,url=env.PUBLIC_ORIGIN+path,payload=sha256(JSON.stringify(body));const post=(path,body,headers={})=>fetch(local+path,{method:'POST',headers:{'Content-Type':'application/json','X-Forwarded-For':ip,...headers},body:JSON.stringify(body)});const issued=await(await post('/api/v2/provision/challenge',{url,method:'POST',payload})).json();const event=finalizeEvent({kind:27235,created_at:Math.floor(Date.now()/1000),content:'',tags:[['u',url],['method','POST'],['payload',payload],['challenge',issued.challenge],['transaction',sha256(issued.transactionToken)]]},secret);return post(path,body,{Authorization:'Nostr '+Buffer.from(JSON.stringify(event)).toString('base64'),'X-Nostr-Transaction':issued.transactionToken});}
  assert.equal((await operation('/api/v2/release-username',{})).status,200);
  assert.equal((await get('alias')).status,404);
+ assert.deepEqual(await identity('alias'),{});
  assert.equal((await operation('/api/v2/claim-username',{username:'alias'},stranger)).status,409);
  assert.equal((await operation('/api/v2/claim-username',{username:'alias'})).status,200);
  assert.equal(db.prepare("SELECT domain FROM pay_links WHERE wallet='owner-wallet'").get().domain,'zaps.nostr-wot.com');

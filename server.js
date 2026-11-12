@@ -176,6 +176,7 @@ const WALLET_API_ALLOWLIST = [
 // ── Per-IP rate limiting ──
 
 const rateLimitBuckets = {
+  nickname: { maxPerMin: 20, entries: new Map() },
   terminalCreate: { maxPerMin: 10, entries: new Map() },
   terminal: { maxPerMin: 180, entries: new Map() },
   nwc:        { maxPerMin: 60, entries: new Map() },
@@ -785,6 +786,34 @@ async function deleteAccount(pubkey, acknowledgeBalance) {
 
 const handleTerminal = terminalHandler({ mailbox: createTerminalMailbox({ origin: BASE_URL }), readBody, allow: checkRateLimit });
 
+function aliasPayLink(pubkey) {
+  const wallet = findWalletByPubkey(pubkey);
+  if (!wallet) return null;
+  const links = openDb(LNURLP_DB_PATH, { readOnly: true });
+  try {
+    const owned = links.prepare('SELECT id, username FROM pay_links WHERE wallet = ?').all(wallet.id);
+    if (owned.length !== 1 || !USERNAME_RE.test(owned[0].username) || !/^[a-zA-Z0-9]+$/.test(owned[0].id)) return null;
+    const matches = links.prepare('SELECT wallet FROM pay_links WHERE username = ?').all(owned[0].username);
+    return matches.length === 1 && matches[0].wallet === wallet.id ? owned[0].id : null;
+  } finally { links.close(); }
+}
+
+function claimedIdentity(name) {
+  const pdb = openProvisionDb();
+  try {
+    const alias = pdb.prepare('SELECT pubkey FROM lightning_aliases WHERE username = ?').get(name);
+    if (alias) return aliasPayLink(alias.pubkey) ? alias.pubkey : null;
+    const links = openDb(LNURLP_DB_PATH, { readOnly: true });
+    try {
+      const matches = links.prepare('SELECT wallet FROM pay_links WHERE username = ?').all(name);
+      if (matches.length !== 1) return null;
+      const owners = pdb.prepare('SELECT pubkey FROM provisioned WHERE wallet_id = ?').all(matches[0].wallet);
+      if (owners.length !== 1 || findWalletByPubkey(owners[0].pubkey)?.id !== matches[0].wallet) return null;
+      return owners[0].pubkey;
+    } finally { links.close(); }
+  } finally { pdb.close(); }
+}
+
 const server = createServer(async (req, res) => {
   try {
     const clientIp = getClientIp(req);
@@ -1105,6 +1134,34 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    if (req.method === 'GET' && parsedUrl.pathname === '/api/username-availability') {
+      if (!checkRateLimit(clientIp, 'nickname')) {
+        res.setHeader('Retry-After', '60');
+        return jsonResponse(res, 429, { error: 'Too many requests' });
+      }
+      const name = parsedUrl.searchParams.get('name');
+      if (!name || !USERNAME_RE.test(name)) return jsonResponse(res, 400, { error: 'Invalid username' });
+      if (RESERVED_USERNAMES.has(name) || _claimingUsernames.has(name)) return jsonResponse(res, 200, { available: false });
+      const reservations = openProvisionDb();
+      try {
+        if (reservations.prepare('SELECT 1 FROM lightning_aliases WHERE username = ?').get(name)) return jsonResponse(res, 200, { available: false });
+      } finally { reservations.close(); }
+      const links = openDb(LNURLP_DB_PATH, { readOnly: true });
+      try {
+        const taken = links.prepare('SELECT 1 FROM pay_links WHERE username = ?').get(name);
+        return jsonResponse(res, 200, { available: !taken });
+      } finally { links.close(); }
+    }
+
+    if (req.method === 'GET' && parsedUrl.pathname === '/.well-known/nostr.json') {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'no-store');
+      if (!checkRateLimit(clientIp, 'lnurl')) return jsonResponse(res, 429, { error: 'Too many requests' });
+      const name = parsedUrl.searchParams.get('name');
+      const key = name && USERNAME_RE.test(name) ? claimedIdentity(name) : null;
+      return jsonResponse(res, 200, { names: key && /^[0-9a-f]{64}$/.test(key) ? { [name]: key } : {} });
+    }
+
     // Only proxy allowlisted LNURL paths (GET only), everything else is 404
     if (req.method === 'GET' && PROXY_ALLOWLIST.some(re => re.test(parsedUrl.pathname))) {
       if (!checkRateLimit(clientIp, 'lnurl')) {
@@ -1117,18 +1174,7 @@ const server = createServer(async (req, res) => {
         try { alias = pdb.prepare('SELECT pubkey FROM lightning_aliases WHERE username = ?').get(username); }
         finally { pdb.close(); }
         if (alias) {
-          const wallet = findWalletByPubkey(alias.pubkey);
-          if (!wallet) return jsonResponse(res, 404, { status: 'ERROR', reason: 'Lightning Address unavailable' });
-          const links = openDb(LNURLP_DB_PATH, { readOnly: true });
-          let target;
-          try {
-            const owned = links.prepare('SELECT id, username FROM pay_links WHERE wallet = ?').all(wallet.id);
-            // Ambiguous or missing links fail closed. Never follow an unowned username.
-            if (owned.length === 1 && USERNAME_RE.test(owned[0].username)) {
-              const matches = links.prepare('SELECT wallet FROM pay_links WHERE username = ?').all(owned[0].username);
-              if (matches.length === 1 && matches[0].wallet === wallet.id && /^[a-zA-Z0-9]+$/.test(owned[0].id)) target = owned[0].id;
-            }
-          } finally { links.close(); }
+          const target = aliasPayLink(alias.pubkey);
           if (!target) return jsonResponse(res, 404, { status: 'ERROR', reason: 'Lightning Address unavailable' });
           // Bind the upstream request to the checked link ID: a released username
           // may be claimed by another wallet before LNbits handles this request.
