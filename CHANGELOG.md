@@ -6,6 +6,10 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
+## 1.0.7 — 2026-11-11
+
+- Resolve claimed Lightning usernames and active aliases to their Nostr public key, and provide rate-limited username availability checks during signup.
+
 ## 1.0.6 — 2026-11-11
 
 - Recover a rotated hosted-wallet key when the signed Nostr account and the saved credential fingerprint match the existing wallet.

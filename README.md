@@ -365,3 +365,9 @@ GNU General Public License, version 3 only ([GPL-3.0-only](LICENSE)). See [NOTIC
 `POST /api/terminal-nfc` accepts `{ "maxMsat": 1000 }` and returns a 60-second session URL, a separate owner capability and expiry. It is an anonymous, rate-limited invoice mailbox with a global capacity limit, not a withdrawal balance or payment authorization. The Android app presents the URL as an `lnurlw://` NDEF record. Public GET discovery advertises LNURL-withdraw metadata; GET `/callback?k1=...&pr=...` accepts one immutable mainnet invoice within the chosen maximum. Repeating the same callback is idempotent. LNURL `OK` means submitted, never settled.
 
 Only the owner bearer capability permits GET `/status` and DELETE of the session. The app validates the invoice, shows its existing payment review and fee information, and requires user confirmation before paying through the configured wallet. The proxy never receives a wallet API key or pays the invoice. Sessions are memory-only, capped at 1,000, expire after 60 seconds, and disappear on restart. Deploy as one process; clustering requires shared atomic session storage first. Do not log session URLs, owner authorization, callback queries or invoices. All responses disable caching. Cancellation or kill-switch activation on the phone stops presentation and payment handling; if it cannot reach the proxy, the mailbox expires on its own. Terminal settlement is observed by the merchant's wallet, not reported by this mailbox.
+
+### Public username lookups
+
+`GET /api/username-availability?name=alice` returns an availability boolean and allows 20 checks per IP per minute. This lookup does not reserve the name. The authenticated claim operation decides ownership.
+
+`GET /.well-known/nostr.json?name=alice` returns the NIP-05 names map for a claimed username or active alias. Unknown names return an empty map.
