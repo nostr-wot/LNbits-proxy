@@ -64,6 +64,18 @@ test('owned aliases route safely, persist, reject strangers and permit owner rec
  const zap=JSON.stringify(finalizeEvent({kind:9734,created_at:1,content:'',tags:[['p',pubkey],['relays','wss://relay.example']]}, key));const callback=await fetch(local+'/lnurlp/api/v1/lnurl/cb/pay?amount=1000&nostr='+encodeURIComponent(encodeURIComponent(zap)));assert.equal(new URL('https://test'+(await callback.json()).path).searchParams.get('nostr'),zap);
  let counter=0;
  async function operation(path,body,secret=key){const ip=`192.0.2.${++counter}`,url=env.PUBLIC_ORIGIN+path,payload=sha256(JSON.stringify(body));const post=(path,body,headers={})=>fetch(local+path,{method:'POST',headers:{'Content-Type':'application/json','X-Forwarded-For':ip,...headers},body:JSON.stringify(body)});const issued=await(await post('/api/v2/provision/challenge',{url,method:'POST',payload})).json();const event=finalizeEvent({kind:27235,created_at:Math.floor(Date.now()/1000),content:'',tags:[['u',url],['method','POST'],['payload',payload],['challenge',issued.challenge],['transaction',sha256(issued.transactionToken)]]},secret);return post(path,body,{Authorization:'Nostr '+Buffer.from(JSON.stringify(event)).toString('base64'),'X-Nostr-Transaction':issued.transactionToken});}
+ const freshKey=generateSecretKey(), handle='new-signup', reserveBody={username:handle,reserveOnly:true};
+ const claim=(body,owner)=>operation('/api/v2/claim-username',body,owner);
+ assert.equal((await claim(reserveBody,freshKey)).status,200);
+ assert.equal((await claim(reserveBody,freshKey)).status,200);
+ assert.equal((await claim(reserveBody,stranger)).status,409);
+ assert.equal((await claim({username:handle},stranger)).status,409);
+ assert.equal((await claim({...reserveBody,username:'another'},freshKey)).status,409);
+ assert.deepEqual(await identity(handle),{[handle]:getPublicKey(freshKey)});
+ assert.equal((await get(handle)).status,404);
+ assert.equal((await operation('/api/v2/delete-account',{confirm:'delete-account',acknowledgeBalance:false},freshKey)).status,200);
+ assert.deepEqual(await identity(handle),{});
+ assert.equal((await claim({...reserveBody,username:'occupied'},freshKey)).status,409);
  assert.equal((await operation('/api/v2/release-username',{})).status,200);
  assert.equal((await get('alias')).status,404);
  assert.deepEqual(await identity('alias'),{});

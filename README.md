@@ -368,6 +368,8 @@ Only the owner bearer capability permits GET `/status` and DELETE of the session
 
 ### Public username lookups
 
+At signup, a signed v2 claim-username request with `{"username":"alice","reserveOnly":true}` reserves one handle per identity. Retrying the same reservation succeeds. NIP-05 works immediately. Lightning lookup becomes payable when the identity has a provisioned wallet with an active pay link. Deleting the hosted account also releases the signup reservation.
+
 `GET /api/username-availability?name=alice` returns an availability boolean and allows 20 checks per IP per minute. This lookup does not reserve the name. The authenticated claim operation decides ownership.
 
 `GET /.well-known/nostr.json?name=alice` returns the NIP-05 names map for a claimed username or active alias. Unknown names return an empty map.

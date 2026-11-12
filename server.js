@@ -115,6 +115,10 @@ function openProvisionDb() {
         username TEXT PRIMARY KEY,
         pubkey TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS signup_handles (
+        pubkey TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE
+      );
       -- One row per completed account deletion. Deliberately carries no pubkey,
       -- user or wallet id: only when it happened and what balance was forfeited.
       CREATE TABLE IF NOT EXISTS account_deletions (
@@ -674,6 +678,12 @@ async function deleteAccount(pubkey, acknowledgeBalance) {
   const pdb = openProvisionDb();
   try {
     mapping = pdb.prepare('SELECT user_id, wallet_id FROM provisioned WHERE pubkey = ?').get(pubkey);
+    if (!mapping) {
+      pdb.exec('BEGIN IMMEDIATE');
+      const removed = deleteSignupHandle(pdb, pubkey);
+      pdb.exec('COMMIT');
+      if (removed) return { status: 200, body: { deleted: true } };
+    }
     if (mapping) {
       sharers = pdb.prepare('SELECT COUNT(*) AS n FROM provisioned WHERE user_id = ? AND pubkey != ?')
         .get(mapping.user_id, pubkey).n;
@@ -764,6 +774,7 @@ async function deleteAccount(pubkey, acknowledgeBalance) {
   const proxyDb = openProvisionDb();
   try {
     proxyDb.exec('BEGIN IMMEDIATE');
+    deleteSignupHandle(proxyDb, pubkey);
     proxyDb.prepare('DELETE FROM wallet_key_history WHERE pubkey = ?').run(pubkey);
     const removed = proxyDb.prepare('DELETE FROM provisioned WHERE pubkey = ?').run(pubkey).changes;
     if (removed) {
@@ -798,10 +809,35 @@ function aliasPayLink(pubkey) {
   } finally { links.close(); }
 }
 
+// Keep signup reservations in the same namespace and transaction as operator aliases.
+function reserveSignupHandle(username, pubkey) {
+  const db = openProvisionDb();
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const previous = db.prepare('SELECT username FROM signup_handles WHERE pubkey = ?').get(pubkey);
+    if (previous) return previous.username === username;
+    if (db.prepare('SELECT 1 FROM lightning_aliases WHERE username = ?').get(username)) return false;
+    const links = openDb(LNURLP_DB_PATH, { readOnly: true });
+    try {
+      if (links.prepare('SELECT 1 FROM pay_links WHERE username = ?').get(username)) return false;
+    } finally { links.close(); }
+    db.prepare('INSERT INTO lightning_aliases (username, pubkey) VALUES (?, ?)').run(username, pubkey);
+    db.prepare('INSERT INTO signup_handles (pubkey, username) VALUES (?, ?)').run(pubkey, username);
+    db.exec('COMMIT');
+    return true;
+  } finally { db.close(); }
+}
+
+function deleteSignupHandle(db, pubkey) {
+  db.prepare('DELETE FROM lightning_aliases WHERE pubkey = ? AND username IN (SELECT username FROM signup_handles WHERE pubkey = ?)').run(pubkey, pubkey);
+  return db.prepare('DELETE FROM signup_handles WHERE pubkey = ?').run(pubkey).changes;
+}
+
 function claimedIdentity(name) {
   const pdb = openProvisionDb();
   try {
     const alias = pdb.prepare('SELECT pubkey FROM lightning_aliases WHERE username = ?').get(name);
+    if (alias && pdb.prepare('SELECT 1 FROM signup_handles WHERE username = ? AND pubkey = ?').get(name, alias.pubkey)) return alias.pubkey;
     if (alias) return aliasPayLink(alias.pubkey) ? alias.pubkey : null;
     const links = openDb(LNURLP_DB_PATH, { readOnly: true });
     try {
@@ -868,7 +904,8 @@ const server = createServer(async (req, res) => {
       const keys = Object.keys(operationBody).sort().join(',');
       const recovery = parsedUrl.pathname === '/api/v2/provision' && keys === 'previousKeyHash'
         && typeof operationBody.previousKeyHash === 'string' && /^[a-f0-9]{64}$/.test(operationBody.previousKeyHash);
-      if (!recovery && keys !== AUTH_ROUTES[parsedUrl.pathname].fields) return jsonResponse(res,400,{error:'Unexpected operation fields'});
+      const signup = parsedUrl.pathname === '/api/v2/claim-username' && keys === 'reserveOnly,username' && operationBody.reserveOnly === true;
+      if (!signup && !recovery && keys !== AUTH_ROUTES[parsedUrl.pathname].fields) return jsonResponse(res,400,{error:'Unexpected operation fields'});
     }
     const verifyOperation = () => {
       try { return auth.verify({authorization:req.headers.authorization,token:req.headers['x-nostr-transaction'],raw:operationRaw,url:BASE_URL+req.url,scope}); }
@@ -961,6 +998,12 @@ const server = createServer(async (req, res) => {
 
       const verified = verifyOperation();
       if (!verified) return;
+
+      if (body.reserveOnly === true) {
+        return reserveSignupHandle(username, verified.pubkey)
+          ? jsonResponse(res, 200, { address: username + '@' + ADDRESS_DOMAIN })
+          : jsonResponse(res, 409, { error: 'Username unavailable' });
+      }
 
       // Look up user's wallet
       const wallet = findWalletByPubkey(verified.pubkey);

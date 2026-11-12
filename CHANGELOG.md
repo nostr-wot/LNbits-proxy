@@ -6,6 +6,10 @@ workflow reads the section whose heading is that exact version and refuses a tag
 with no such section, so the name matters. Entries from before this convention keep
 their descriptive headings.
 
+## 1.0.8 — 2026-11-11
+
+- Reserve a Nostr handle during signup without opening a wallet. Activate its Lightning address when the owner links a hosted payment destination.
+
 ## 1.0.7 — 2026-11-11
 
 - Resolve claimed Lightning usernames and active aliases to their Nostr public key, and provide rate-limited username availability checks during signup.
