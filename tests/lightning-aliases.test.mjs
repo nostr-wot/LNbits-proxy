@@ -76,6 +76,18 @@ test('owned aliases route safely, persist, reject strangers and permit owner rec
  assert.equal((await operation('/api/v2/delete-account',{confirm:'delete-account',acknowledgeBalance:false},freshKey)).status,200);
  assert.deepEqual(await identity(handle),{});
  assert.equal((await claim({...reserveBody,username:'occupied'},freshKey)).status,409);
+ // Connect an empty wallet to a previously reserved identity, then drop its payment link.
+ const laterKey=generateSecretKey(), laterPubkey=getPublicKey(laterKey);
+ assert.equal((await claim({username:'later',reserveOnly:true},laterKey)).status,200);
+ db.exec("INSERT INTO accounts VALUES ('later-user',NULL,NULL); INSERT INTO wallets VALUES ('later-wallet','test','admin3','in3','later-user',0)");
+ pdb.prepare('INSERT INTO provisioned VALUES(?,?,?,0)').run(laterPubkey,'later-user','later-wallet');
+ assert.equal((await get('later')).status,404);
+ assert.equal((await claim({username:'later'},laterKey)).status,200);
+ const laterLink=db.prepare("SELECT id FROM pay_links WHERE wallet='later-wallet'").get().id;
+ assert.equal((await(await get('later')).json()).path,'/lnurlp/api/v1/lnurl/'+laterLink);
+ assert.equal((await operation('/api/v2/release-username',{},laterKey)).status,200);
+ assert.equal((await get('later')).status,404);
+ assert.deepEqual(await identity('later'),{later:laterPubkey});
  assert.equal((await operation('/api/v2/release-username',{})).status,200);
  assert.equal((await get('alias')).status,404);
  assert.deepEqual(await identity('alias'),{});
@@ -92,5 +104,5 @@ test('owned aliases route safely, persist, reject strangers and permit owner rec
  db.prepare("UPDATE accounts SET pubkey=? WHERE id='stranger'").run(pubkey);
  assert.equal((await get('occupied')).status,404,'must not fall back to occupied foreign link or accounts.pubkey');
  assert.equal((await operation('/api/v2/claim-username',{username:'primary'},stranger)).status,409);
- assert.equal(pdb.prepare('SELECT COUNT(*) AS n FROM lightning_aliases').get().n,3);
+ assert.equal(pdb.prepare('SELECT COUNT(*) AS n FROM lightning_aliases').get().n,4);
 });
